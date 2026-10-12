@@ -1,0 +1,29 @@
+name: Deploy Backend to EC2
+
+on:
+  push:
+    branches: [main, staging]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install and Start App
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cd /home/ubuntu
+            # Delete old folder if it got messed up, and download a fresh copy
+            rm -rf 3w-wheeler-backend
+            git clone https://github.com/focus-apps-2025/3w-wheeler-backend.git
+            
+            # Go inside, install, and start
+            cd 3w-wheeler-backend
+            npm install
+            sudo npm install -g pm2
+            pm2 restart backend || pm2 start server.js --name "backend"
+            pm2 save

@@ -1,0 +1,44 @@
+# Focus Forms Backend
+
+## AWS Server Management (PM2)
+
+### Quick Commands
+
+#### 1. Restart Backend Service
+```bash
+# Restart already registered process
+pm2 restart backend
+
+# Or force re-execute if needed
+pm2 start server.js --name "backend" -f
+```
+
+#### 2. Start Backend Service
+```bash
+cd /home/ubuntu/3w-wheeler-backend
+pm2 start server.js --name "backend"
+```
+
+#### 3. Check Status & Process List
+```bash
+pm2 status
+# or
+pm2 list
+```
+
+#### 4. View Live Logs
+```bash
+pm2 logs backend
+# View last 100 lines
+pm2 logs backend --lines 100
+```
+
+#### 5. Stop Backend Service
+```bash
+pm2 stop backend
+```
+
+#### 6. Save Current PM2 List for System Reboots
+```bash
+pm2 save
+```

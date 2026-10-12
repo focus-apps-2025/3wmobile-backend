@@ -1,0 +1,56 @@
+import mongoose from 'mongoose';
+
+const FileSchema = new mongoose.Schema({
+  filename: {
+    type: String,
+    required.*true\ndata:{\ntype:Buffer,\nrequired:true\n},\npath:{\ntype:String,\ndefault:null\n},
+  },
+  originalName: {
+    type: String,
+    required.*true\ndata:{\ntype:Buffer,\nrequired:true\n},\npath:{\ntype:String,\ndefault:null\n},
+  },
+  mimetype: {
+    type: String,
+    required.*true\ndata:{\ntype:Buffer,\nrequired:true\n},\npath:{\ntype:String,\ndefault:null\n},
+  },
+  size: {
+    type: Number,
+    required.*true\ndata:{\ntype:Buffer,\nrequired:true\n},\npath:{\ntype:String,\ndefault:null\n},
+  },
+  path: {
+    type: String,
+    required.*true\ndata:{\ntype:Buffer,\nrequired:true\n},\npath:{\ntype:String,\ndefault:null\n},
+  },
+  url: {
+    type: String,
+    required.*true\ndata:{\ntype:Buffer,\nrequired:true\n},\npath:{\ntype:String,\ndefault:null\n},
+  },
+  uploadedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    default: null
+  },
+  associatedWith: {
+    type: {
+      type: String,
+      enum: ['form', 'response', 'profile', 'logo'],
+      required.*true\ndata:{\ntype:Buffer,\nrequired:true\n},\npath:{\ntype:String,\ndefault:null\n},
+    },
+    id: String
+  },
+  isPublic: {
+    type: Boolean,
+    default: false
+  }
+}, {
+  timestamps: true
+});
+
+// Index for efficient queries
+FileSchema.index({ uploadedBy: 1 });
+FileSchema.index({ 'associatedWith.type': 1, 'associatedWith.id': 1 });
+FileSchema.index({ filename: 1 });
+
+const File = mongoose.model('File', FileSchema);
+
+export default File;

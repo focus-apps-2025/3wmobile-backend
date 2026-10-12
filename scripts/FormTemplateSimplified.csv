@@ -1,0 +1,5 @@
+Form Title,Form Description,Section Number,Section Title,Section Description,Question,Question Description,Question Type,Required,Options,Option Notes,Section Navigation,Follow up Option,Parent Question,Correct Answer,Correct Answers
+Pet Quiz Survey,Quick survey about pet preferences,1,Welcome,Tell us about your favorite animals,Which is your favorite pet?,Choose one animal,radio,TRUE,"dog,cat,pig",Three common pets,2;3;4,NO,,dog,
+Pet Quiz Survey,Quick survey about pet preferences,2,Dog Lovers,For dog enthusiasts,What do you like about dogs?,Multiple options,checkbox,FALSE,"Loyal,Friendly,Playful",Positive traits,,NO,,Loyal,Loyal|Friendly
+Pet Quiz Survey,Quick survey about pet preferences,3,Cat Lovers,For cat enthusiasts,What breed is your cat?,Single choice,radio,FALSE,"Siamese,Persian,Tabby,Other",Cat breeds,,NO,,,
+Pet Quiz Survey,Quick survey about pet preferences,4,Pig Lovers,For pig enthusiasts,Have you seen a pig farm?,Yes or no,boolean,TRUE,,,,NO,,YES,

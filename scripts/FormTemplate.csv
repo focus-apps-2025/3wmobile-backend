@@ -1,0 +1,3 @@
+Form Title,Form Description,Section Number,Section Title,Section Description,Question,Question Description,Question Type,Required,Options,Option Notes,Section Navigation,Follow up Option,Parent Question,Correct Answer,Correct Answers
+Customer Survey,Quick survey about customer type,1,Customer Info,Tell us about yourself,What type of customer are you?,Select your customer status,radio,TRUE,"New Customer, Existing Customer, VIP Customer",Customer categories,2;3;4,NO,,New Customer,
+Pet Preference Quiz,Which pet do you like?,2,Pet Selection,Pick your favorite pet,Which is your favorite pet?,dog or cat or pig,radio,TRUE,"dog,cat,pig",Different animals,3;4;5,NO,,dog,
