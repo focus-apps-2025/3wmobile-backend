@@ -23,11 +23,18 @@ router.post("/", (req, res) => {
   res.status(200).send({ success: true, message: "Deployment triggered" });
 
   // Async deploy
-  exec("cd /var/www/3w-wheeler-backend && git fetch origin main && git reset --hard origin/main && npm ci --omit=dev && pm2 restart 3w-wheeler-backend",
+  exec(
+    "cd /var/www/3wmobile-backend && git fetch origin main && git reset --hard origin/main && npm ci --omit=dev && pm2 restart 3wmobile-backend --update-env",
     (err, stdout, stderr) => {
-      if (err) return console.error("❌ Deployment failed:", err);
+      if (err) {
+        return console.error("❌ Deployment failed:", err);
+      }
+
       console.log("✅ Deployment complete:\n", stdout);
-      if (stderr) console.error(stderr);
+
+      if (stderr) {
+        console.error(stderr);
+      }
     });
 });
 
