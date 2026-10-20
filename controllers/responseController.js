@@ -2549,102 +2549,195 @@ export const getSuggestedAnswers = async (req, res) => {
  * Returns prior attempts for every chassis on this form (or delta since a timestamp).
  * Used to hydrate mobile cached_attempts.
  */
+const formAttemptsMemoryCache = new Map();
+
+export const clearAttemptsCache = (formId) => {
+  if (formId) {
+    formAttemptsMemoryCache.delete(String(formId));
+  } else {
+    formAttemptsMemoryCache.clear();
+  }
+};
+
 export const getFormAttempts = async (req, res) => {
   try {
     const { formId } = req.params;
-    const { since } = req.query;
+    const { since, chassisNumber } = req.query;
 
     if (!formId) {
       return res.status(400).json({ success: false, message: 'formId is required' });
     }
 
-    let form = await Form.findOne({ id: formId });
-    if (!form && mongoose.Types.ObjectId.isValid(formId)) {
-      form = await Form.findById(formId);
-    }
-    const formIds = form ? getThisFormIds(form, formId) : [formId];
+    const cacheKey = String(formId);
+    let attempts = null;
+    const cachedEntry = formAttemptsMemoryCache.get(cacheKey);
+    const now = Date.now();
 
-    const query = {
-      $or: [
-        { questionId: { $in: formIds } },
-        { formId: { $in: formIds } }
-      ]
-    };
-
-    if (since) {
-      const sinceDate = new Date(since);
-      if (!isNaN(sinceDate.getTime())) {
-        query.createdAt = { $gte: sinceDate };
+    // Cache valid for 45 seconds if no since filter
+    if (cachedEntry && (now - cachedEntry.timestamp < 45000) && !since) {
+      attempts = cachedEntry.attempts;
+    } else {
+      let form = await Form.findOne({ id: formId });
+      if (!form && mongoose.Types.ObjectId.isValid(formId)) {
+        form = await Form.findById(formId);
       }
-    }
+      const formIds = form ? getThisFormIds(form, formId) : [formId];
 
-    const responses = await Response.find(query)
-      .sort({ createdAt: 1 })
-      .lean();
-
-    const chassisAttemptsMap = new Map();
-
-    const attempts = responses.map((resp) => {
-      let answersObj = resp.answers || {};
-      if (answersObj instanceof Map) {
-        answersObj = Object.fromEntries(answersObj);
-      }
-
-      let chassis = resp.chassisNumber || 
-                    answersObj.chassis_number || 
-                    answersObj.chassisNumber ||
-                    answersObj['Identification Number'] ||
-                    answersObj.identification_number ||
-                    answersObj.identificationNumber ||
-                    answersObj.identification ||
-                    answersObj.Identification ||
-                    answersObj['ID number'] ||
-                    answersObj['ID Number'] ||
-                    answersObj.id_number ||
-                    answersObj.idNumber;
-
-      if (!chassis) {
-        for (const [k, v] of Object.entries(answersObj)) {
-          if (v && typeof v === 'object' && (v.chassisNumber || v.value)) {
-            chassis = v.chassisNumber || v.value;
-            break;
+      // Identify first answerable question ID (Identification Number)
+      let firstQId = null;
+      if (form) {
+        const sections = form.sections || [];
+        for (const sec of sections) {
+          const qs = sec.questions || [];
+          for (const q of qs) {
+            const qId = (q.id || q._id)?.toString();
+            const qType = String(q.type || '').toLowerCase();
+            const qText = String(q.text || q.title || q.question || '').toLowerCase();
+            if (qId && !['heading', 'section', 'description', 'divider', 'info'].includes(qType)) {
+              if (!firstQId) firstQId = qId;
+              if (q.trackResponseRank || q.trackResponseQuestion || qText.includes('identification') || qText.includes('chassis') || qText.includes('vin')) {
+                firstQId = qId;
+                break;
+              }
+            }
           }
-          const kLow = k.toLowerCase();
-          if ((kLow.includes('identification') || kLow.includes('chassis') || kLow.includes('vin')) && typeof v === 'string' && v.trim().length >= 1) {
-            chassis = v.trim();
-            break;
-          }
+          if (firstQId) break;
         }
       }
-      chassis = chassis ? String(chassis).trim() : 'UNKNOWN';
 
-      const currentCount = chassisAttemptsMap.get(chassis) || 0;
-      const rank = resp.rank || (currentCount + 1);
-      chassisAttemptsMap.set(chassis, Math.max(currentCount + 1, rank));
-
-      let status = resp.subStatus || resp.status || 'Accepted';
-      // Normalize status to Accepted / Rework / Rejected
-      if (String(status).toLowerCase().includes('rework')) status = 'Rework';
-      else if (String(status).toLowerCase().includes('reject')) status = 'Rejected';
-      else status = 'Accepted';
-
-      return {
-        attemptId: (resp._id || resp.id).toString(),
-        chassisNumber: chassis,
-        rank: rank,
-        status: status,
-        answers: answersObj,
-        submittedBy: resp.submittedByName || resp.submittedBy || 'Inspector',
-        submittedAt: resp.createdAt ? new Date(resp.createdAt).toISOString() : new Date().toISOString()
+      const query = {
+        $or: [
+          { questionId: { $in: formIds } },
+          { formId: { $in: formIds } }
+        ]
       };
-    });
+
+      if (since) {
+        const sinceDate = new Date(since);
+        if (!isNaN(sinceDate.getTime())) {
+          query.createdAt = { $gte: sinceDate };
+        }
+      }
+
+      const responses = await Response.find(query)
+        .select('_id id chassisNumber rank status subStatus answers submittedByName submittedBy createdAt')
+        .sort({ createdAt: 1 })
+        .lean();
+
+      const chassisAttemptsMap = new Map();
+
+      attempts = responses.map((resp) => {
+        let answersObj = resp.answers || {};
+        if (answersObj instanceof Map) {
+          answersObj = Object.fromEntries(answersObj);
+        }
+
+        let idValue = '';
+        if (firstQId && answersObj[firstQId]) {
+          const raw = answersObj[firstQId];
+          idValue = typeof raw === 'object' && raw ? (raw.value || raw.chassisNumber || raw.text || '') : String(raw);
+          idValue = idValue.trim();
+        }
+
+        let chassis = idValue ||
+                      answersObj['Identification Number'] ||
+                      answersObj.identification_number ||
+                      answersObj.identificationNumber ||
+                      answersObj.identification ||
+                      answersObj.Identification ||
+                      answersObj['ID number'] ||
+                      answersObj['ID Number'] ||
+                      answersObj.id_number ||
+                      answersObj.idNumber ||
+                      (answersObj.chassis_number && String(answersObj.chassis_number).trim() !== 'TVS' ? answersObj.chassis_number : '') ||
+                      (answersObj.chassisNumber && String(answersObj.chassisNumber).trim() !== 'TVS' ? answersObj.chassisNumber : '') ||
+                      (resp.chassisNumber && String(resp.chassisNumber).trim() !== 'TVS' ? resp.chassisNumber : '');
+
+        if (!chassis) {
+          for (const [k, v] of Object.entries(answersObj)) {
+            if (v && typeof v === 'object' && (v.chassisNumber || v.value)) {
+              chassis = v.chassisNumber || v.value;
+              break;
+            }
+            const kLow = k.toLowerCase();
+            if ((kLow.includes('identification') || kLow.includes('chassis') || kLow.includes('vin')) && typeof v === 'string' && v.trim().length >= 1) {
+              chassis = v.trim();
+              break;
+            }
+          }
+        }
+        if (!chassis) {
+          chassis = resp.chassisNumber || answersObj.chassis_number || answersObj.chassisNumber || 'UNKNOWN';
+        }
+        chassis = String(chassis).trim();
+
+        const currentCount = chassisAttemptsMap.get(chassis) || 0;
+        const rank = resp.rank || (currentCount + 1);
+        chassisAttemptsMap.set(chassis, Math.max(currentCount + 1, rank));
+
+        let status = resp.subStatus || resp.status || 'Accepted';
+        if (String(status).toLowerCase().includes('rework')) status = 'Rework';
+        else if (String(status).toLowerCase().includes('reject')) status = 'Rejected';
+        else status = 'Accepted';
+
+        const sanitizedAnswers = {};
+        for (const [k, v] of Object.entries(answersObj)) {
+          if (typeof v === 'string') {
+            sanitizedAnswers[k] = v.startsWith('data:image') ? '' : v;
+          } else if (v && typeof v === 'object') {
+            const vCopy = { ...v };
+            if (typeof vCopy.evidenceUrl === 'string' && vCopy.evidenceUrl.startsWith('data:image')) {
+              vCopy.evidenceUrl = '';
+            }
+            sanitizedAnswers[k] = vCopy;
+          } else {
+            sanitizedAnswers[k] = v;
+          }
+        }
+
+        return {
+          attemptId: (resp._id || resp.id).toString(),
+          chassisNumber: chassis,
+          identificationNumber: idValue || chassis,
+          rank: rank,
+          status: status,
+          answers: sanitizedAnswers,
+          submittedBy: resp.submittedByName || resp.submittedBy || 'Inspector',
+          submittedAt: resp.createdAt ? new Date(resp.createdAt).toISOString() : new Date().toISOString()
+        };
+      });
+
+      if (!since) {
+        formAttemptsMemoryCache.set(cacheKey, { attempts, timestamp: now });
+      }
+    }
+
+    let filteredAttempts = attempts;
+    if (chassisNumber) {
+      const c = String(chassisNumber).trim().toLowerCase();
+      filteredAttempts = attempts.filter((a) => {
+        const cn = String(a.chassisNumber || '').trim().toLowerCase();
+        const idn = String(a.identificationNumber || '').trim().toLowerCase();
+        if (cn === c || idn === c) return true;
+        if (a.answers && typeof a.answers === 'object') {
+          for (const val of Object.values(a.answers)) {
+            if (typeof val === 'string' && val.trim().toLowerCase() === c) return true;
+            if (val && typeof val === 'object') {
+              const v = String(val.value || val.chassisNumber || '').trim().toLowerCase();
+              if (v === c) return true;
+            }
+          }
+        }
+        return false;
+      });
+    }
 
     return res.status(200).json({
       success: true,
       data: {
         formId,
         generatedAt: new Date().toISOString(),
-        attempts
+        attempts: filteredAttempts
       }
     });
   } catch (error) {

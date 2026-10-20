@@ -323,6 +323,9 @@ ResponseSchema.index({ tenantId: 1, createdAt: -1 });
 
 // Form-specific queries: filter by questionId (formId), sort by createdAt desc
 ResponseSchema.index({ questionId: 1, createdAt: -1 });
+ResponseSchema.index({ questionId: 1, createdAt: 1 });
+ResponseSchema.index({ formId: 1, createdAt: -1 });
+ResponseSchema.index({ formId: 1, createdAt: 1 });
 
 // Inspector queries: filter by createdBy + questionId
 ResponseSchema.index({ createdBy: 1, questionId: 1, createdAt: -1 });
