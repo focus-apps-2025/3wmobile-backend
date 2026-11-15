@@ -20,8 +20,7 @@ import {
   autoFillChassisNumbers,
   getBiwSummary,
   bulkUpdateBiwReview,
-  getFormAttempts,
-  batchSyncResponses
+  batchSyncResponses,
 } from '../controllers/responseController.js';
 import { getReviewsForResponse, getBulkReviewsForResponses } from '../controllers/userController.js';
 import {
@@ -38,6 +37,7 @@ import { processResponseImages, processGoogleDriveImage } from '../services/goog
 const router = express.Router();
 router.post('/reviews/bulk', getBulkReviewsForResponses);
 router.get('/reviews/:responseId', getReviewsForResponse);
+
 // Middleware for guest access control
 const guestAccessControl = (req, res, next) => {
   if (req.user && req.user.isGuest) {
@@ -45,7 +45,7 @@ const guestAccessControl = (req, res, next) => {
     if (formId && req.user.accessibleFormId !== formId) {
       return res.status(403).json({
         success: false,
-        message: 'Access denied. You can only view data for your assigned form.'
+        message: 'Access denied. You can only view data for your assigned form.',
       });
     }
     return next();
@@ -81,7 +81,7 @@ router.post('/process-images', async (req, res) => {
     if (!answers || typeof answers !== 'object') {
       return res.status(400).json({
         success: false,
-        message: 'Invalid request: answers object required'
+        message: 'Invalid request: answers object required',
       });
     }
 
@@ -89,16 +89,18 @@ router.post('/process-images', async (req, res) => {
 
     let processedAnswers = answers;
     try {
-      const onProgress = submissionId ? (progressData) => {
-        const io = req.app.get('io');
-        if (io) {
-          io.to(submissionId).emit('image-progress', {
-            submissionId,
-            status: progressData
-          });
-          console.log(`[PROGRESS] ${progressData.currentImage}/${progressData.totalImages}`);
+      const onProgress = submissionId
+        ? (progressData) => {
+          const io = req.app.get('io');
+          if (io) {
+            io.to(submissionId).emit('image-progress', {
+              submissionId,
+              status: progressData,
+            });
+            console.log(`[PROGRESS] ${progressData.currentImage}/${progressData.totalImages}`);
+          }
         }
-      } : null;
+        : null;
 
       processedAnswers = await processResponseImages(answers, onProgress);
       console.log('[PROCESS IMAGES] Successfully processed all images');
@@ -106,20 +108,16 @@ router.post('/process-images', async (req, res) => {
       console.error('[PROCESS IMAGES] Failed to process images:', error.message);
       return res.status(400).json({
         success: false,
-        message: 'Failed to process images: ' + error.message
+        message: 'Failed to process images: ' + error.message,
       });
     }
 
-    res.status(200).json({
-      success: true,
-      data: processedAnswers
-    });
-
+    res.status(200).json({ success: true, data: processedAnswers });
   } catch (error) {
     console.error('Process images error:', error);
     res.status(500).json({
       success: false,
-      message: 'Internal server error during image processing'
+      message: 'Internal server error during image processing',
     });
   }
 });
@@ -132,7 +130,7 @@ router.post('/convert-image', async (req, res) => {
     if (!imageUrl || typeof imageUrl !== 'string') {
       return res.status(400).json({
         success: false,
-        message: 'Invalid request: imageUrl (string) required'
+        message: 'Invalid request: imageUrl (string) required',
       });
     }
 
@@ -140,18 +138,12 @@ router.post('/convert-image', async (req, res) => {
 
     const cloudinaryUrl = await processGoogleDriveImage(imageUrl, 'display');
 
-    res.status(200).json({
-      success: true,
-      data: {
-        cloudinaryUrl
-      }
-    });
-
+    res.status(200).json({ success: true, data: { cloudinaryUrl } });
   } catch (error) {
     console.error('Convert image error:', error);
     res.status(500).json({
       success: false,
-      message: 'Internal server error during image conversion'
+      message: 'Internal server error during image conversion',
     });
   }
 });
@@ -159,7 +151,7 @@ router.post('/convert-image', async (req, res) => {
 // 6. SINGLE RESPONSE CREATION (optional auth - allows public with token if provided)
 router.post('/:tenantSlug/forms/:formId/responses', authenticateOptional, createResponse);
 
-// 7. GET RANK (PUBLIC)
+// 7. GET RANK (PUBLIC) — now also returns the full attempts payload + cache
 router.get('/rank', getRank);
 router.get('/:tenantSlug/forms/:formId/rank', getRank);
 
@@ -167,26 +159,18 @@ router.get('/:tenantSlug/forms/:formId/rank', getRank);
 router.get('/suggestions', getSuggestedAnswers);
 router.get('/:tenantSlug/forms/:formId/suggestions', getSuggestedAnswers);
 
-// 8b. GET ATTEMPTS & BATCH SYNC
-router.get('/attempts/:formId', getFormAttempts);
-router.get('/:tenantSlug/forms/:formId/attempts', getFormAttempts);
+// 8b. BATCH SYNC (attempts routes removed — use /rank instead)
 router.post('/batch-sync', authenticateOptional, batchSyncResponses);
 
 // 9. GET PREVIOUS ANSWERS (PUBLIC)
 router.get('/previous-answers', getQuestionPreviousAnswers);
 router.get('/:tenantSlug/forms/:formId/previous-answers', getQuestionPreviousAnswers);
 
-
-
 // ========== PROTECTED ROUTES (Require Auth) ==========
 router.use(authenticate);
 router.use(addTenantFilter);
 
 router.post('/batch/import', batchImportResponses);
-
-// Form-specific responses (Already defined in public section)
-// router.get('/form/:formId', getResponsesByForm);
-// router.get('/form/:formId/export', exportResponses);
 
 // Bulk auto-fill: fills any response on this form whose chassis_number is
 // missing/blank with the first configured chassis number, in one DB call.
@@ -205,11 +189,12 @@ router.post('/', createResponse);
 router.post('/:formId', createResponse);
 router.get('/:id', getResponseById);
 router.put('/:id', updateResponse);
+router.patch('/:id', updateResponse);
+
 router.patch('/:id/assign', assignResponse);
 router.delete('/:id', deleteResponse);
 router.delete('/', deleteMultipleResponses);
 router.post('/:responseId/auto-assign', autoAssignResponse);
-
 
 // DEBUG: Log all registered routes
 console.log('\n=== Registered Response Routes ===');
@@ -218,7 +203,6 @@ router.stack.forEach((layer) => {
     const methods = Object.keys(layer.route.methods).join(', ').toUpperCase();
     console.log(`${methods} ${layer.route.path}`);
   } else if (layer.name === 'router') {
-    // This is a nested router
     console.log(`Nested router at: ${layer.regexp}`);
   }
 });
