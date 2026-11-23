@@ -1,52 +1,28 @@
-// controllers/responseController.js
 import mongoose from 'mongoose';
 import Response from '../models/Response.js';
 import Form from '../models/Form.js';
 import Tenant from '../models/Tenant.js';
 import { v4 as uuidv4 } from 'uuid';
 import { collectSubmissionMetadata } from '../services/locationService.js';
-import {
-  emitResponseCreated,
-  emitResponseUpdated,
-  emitResponseDeleted,
-  emitImageProgress,
-  emitBatchImported,
-} from '../socket/socketHandler.js';
-import { processResponseImages, isGoogleDriveUrl } from '../services/googleDriveService.js';
+import { emitResponseCreated, emitResponseUpdated, emitResponseDeleted, emitImageProgress, emitBatchImported } from '../socket/socketHandler.js';
+import { processResponseImages } from '../services/googleDriveService.js';
+import { isGoogleDriveUrl } from '../services/googleDriveService.js';
 import FormInvite from '../models/FormInvite.js';
+import User from '../models/User.js';
+import FormSession from '../models/FormSession.js';
+import Review from '../models/Review.js';
 import ChatMessage from '../models/ChatMessage.js';
 import { recordImportHistory } from './importHistoryController.js';
-import { invalidateCache } from '../utils/cache.js';
-
-// ─────────────────────────────────────────────────────────────────────────────
-// In-memory caches
-// ─────────────────────────────────────────────────────────────────────────────
-const suggestionsMemoryCache = new Map();
-const formMetaCache = new Map();
-const tenantSlugCache = new Map();
-
-// Unified rank/attempts cache (replaces the old formAttemptsMemoryCache).
-// Key: `${formId}:${questionId}:${answerLower}` — 45 second TTL.
-const rankCache = new Map();
-const RANK_CACHE_TTL_MS = 45 * 1000;
-
-export const clearRankCache = (formId) => {
-  if (!formId) {
-    rankCache.clear();
-    return;
-  }
-  const prefix = `${String(formId)}:`;
-  for (const key of rankCache.keys()) {
-    if (key.startsWith(prefix)) rankCache.delete(key);
-  }
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Shared/Linked-Tenant Response Access Helper
-// ─────────────────────────────────────────────────────────────────────────────
-// Response docs are stamped with the FORM OWNER's tenantId, never the
-// submitter's. This helper resolves the form first, then permits access when
-// the acting user is owner / shared / chassis-assigned / creator / same-tenant.
+//hello 
+// ─── Shared/Linked-Tenant Response Access Helper ─────────────────────────────
+// Response documents are always stamped with the FORM OWNER's tenantId (see
+// createResponse: `tenantId: form.tenantId`), never the submitting user's own
+// tenantId. Several endpoints used to bake `req.tenantFilter` (the acting
+// user's own tenant) directly into their `Response.findOne`/`deleteMany`/etc.
+// queries, which meant a user from a tenant a form was merely *shared* with
+// could never find, update, dispatch, review, reassign, or delete responses
+// on that shared form — every such call silently 404'd or matched nothing.
+// Helper to extract all possible chassis identifiers for matching assignments
 const extractResponseChassisCandidates = (response) => {
   const candidates = new Set();
   if (response.chassisNumber) candidates.add(String(response.chassisNumber).trim().toLowerCase());
@@ -66,7 +42,7 @@ const extractResponseChassisCandidates = (response) => {
           const strVal = String(val).trim().toLowerCase();
           if (!strVal) continue;
           const kLower = key.toLowerCase();
-          if (chassisKeyPatterns.some((p) => kLower.includes(p))) {
+          if (chassisKeyPatterns.some(p => kLower.includes(p))) {
             candidates.add(strVal);
           }
         }
@@ -76,6 +52,24 @@ const extractResponseChassisCandidates = (response) => {
   return Array.from(candidates);
 };
 
+
+const rankCache = new Map();
+
+export const clearRankCache = (formId) => {
+  if (!formId) {
+    rankCache.clear();
+    return;
+  }
+  const prefix = `${String(formId)}:`;
+  for (const key of rankCache.keys()) {
+    if (key.startsWith(prefix)) rankCache.delete(key);
+  }
+};
+
+// This mirrors the correct pattern already used in getResponsesByForm:
+// resolve the response/form first, then only enforce the tenant boundary
+// when the acting user is neither the owner tenant, a shared tenant, nor
+// granted chassis-level access.
 const canAccessResponseTenant = async (req, response) => {
   if (!response) return false;
   if (req.user?.role === 'superadmin') return true;
@@ -83,8 +77,7 @@ const canAccessResponseTenant = async (req, response) => {
   const userTenantIdStr = req.user?.tenantId ? req.user.tenantId.toString() : null;
   const responseTenantIdStr = response.tenantId ? response.tenantId.toString() : null;
   const matchesResponseTenant = responseTenantIdStr && responseTenantIdStr === userTenantIdStr;
-  const matchesCreator =
-    req.user?._id && response.createdBy && String(response.createdBy) === String(req.user._id);
+  const matchesCreator = req.user?._id && response.createdBy && String(response.createdBy) === String(req.user._id);
 
   if (matchesResponseTenant || matchesCreator) return true;
 
@@ -100,22 +93,18 @@ const canAccessResponseTenant = async (req, response) => {
     }
   }
 
-  const form = await Form.findOne({ $or: or_conditions })
-    .select('tenantId sharedWithTenants chassisTenantAssignments parentFormId parentForm')
-    .lean();
+  const form = await Form.findOne({
+    $or: or_conditions,
+  }).select('tenantId sharedWithTenants chassisTenantAssignments parentFormId parentForm').lean();
 
   const isOwnerTenant = form?.tenantId && form.tenantId.toString() === userTenantIdStr;
   const isSharedTenant =
     form?.sharedWithTenants &&
     form.sharedWithTenants.some((t) => String(t?._id || t?.id || t) === userTenantIdStr);
-
   let matchesAssignedChassis = false;
   if (Array.isArray(form?.chassisTenantAssignments) && userTenantIdStr) {
     const myAssignedChassis = form.chassisTenantAssignments
-      .filter((a) =>
-        a.assignedTenants &&
-        a.assignedTenants.some((t) => String(t?._id || t?.id || t) === userTenantIdStr)
-      )
+      .filter((a) => a.assignedTenants && a.assignedTenants.some((t) => String(t?._id || t?.id || t) === userTenantIdStr))
       .map((a) => String(a.chassisNumber || '').trim().toLowerCase())
       .filter(Boolean);
 
@@ -127,12 +116,13 @@ const canAccessResponseTenant = async (req, response) => {
     }
   }
 
+  // Also check parent form if linked either by parentFormId OR by being in childForms of a parent form
   let matchesParentFormAccess = false;
   if (!isOwnerTenant && !isSharedTenant && !matchesAssignedChassis && userTenantIdStr) {
     const formIdentifiers = [form?.id, form?._id ? form._id.toString() : null, targetFormId].filter(Boolean);
     const parentQuery = [
       { 'childForms.formId': { $in: formIdentifiers } },
-      { 'childForms.id': { $in: formIdentifiers } },
+      { 'childForms.id': { $in: formIdentifiers } }
     ];
     const parentId = form?.parentFormId || form?.parentForm?.id || form?.parentForm?._id;
     if (parentId) {
@@ -141,105 +131,46 @@ const canAccessResponseTenant = async (req, response) => {
     }
 
     const parentFormDoc = await Form.findOne({ $or: parentQuery })
-      .select('tenantId sharedWithTenants chassisTenantAssignments')
-      .lean();
+      .select('tenantId sharedWithTenants chassisTenantAssignments').lean();
 
     if (parentFormDoc) {
-      const isParentOwner =
-        parentFormDoc.tenantId && parentFormDoc.tenantId.toString() === userTenantIdStr;
-      const isParentShared =
-        Array.isArray(parentFormDoc.sharedWithTenants) &&
-        parentFormDoc.sharedWithTenants.some((t) => String(t?._id || t?.id || t) === userTenantIdStr);
-      const isParentAssigned =
-        Array.isArray(parentFormDoc.chassisTenantAssignments) &&
-        (() => {
-          const myParentAssigned = parentFormDoc.chassisTenantAssignments
-            .filter((a) =>
-              a.assignedTenants &&
-              a.assignedTenants.some((t) => String(t?._id || t?.id || t) === userTenantIdStr)
-            )
-            .map((a) => String(a.chassisNumber || '').trim().toLowerCase())
-            .filter(Boolean);
-          if (myParentAssigned.length === 0) return false;
-          const respChassisCandidates = extractResponseChassisCandidates(response);
-          return respChassisCandidates.some((c) => myParentAssigned.includes(c));
-        })();
+      const isParentOwner = parentFormDoc.tenantId && parentFormDoc.tenantId.toString() === userTenantIdStr;
+      const isParentShared = Array.isArray(parentFormDoc.sharedWithTenants) && parentFormDoc.sharedWithTenants.some((t) => String(t?._id || t?.id || t) === userTenantIdStr);
+      const isParentAssigned = Array.isArray(parentFormDoc.chassisTenantAssignments) && (() => {
+        const myParentAssigned = parentFormDoc.chassisTenantAssignments
+          .filter((a) => a.assignedTenants && a.assignedTenants.some((t) => String(t?._id || t?.id || t) === userTenantIdStr))
+          .map((a) => String(a.chassisNumber || '').trim().toLowerCase())
+          .filter(Boolean);
+        if (myParentAssigned.length === 0) return false;
+        const respChassisCandidates = extractResponseChassisCandidates(response);
+        return respChassisCandidates.some((c) => myParentAssigned.includes(c));
+      })();
       matchesParentFormAccess = Boolean(isParentOwner || isParentShared || isParentAssigned);
     }
   }
 
+  // Also check child forms: if user owns or has access to a child form of this form
   let matchesChildFormAccess = false;
-  if (
-    !isOwnerTenant &&
-    !isSharedTenant &&
-    !matchesAssignedChassis &&
-    !matchesParentFormAccess &&
-    userTenantIdStr &&
-    Array.isArray(form?.childForms) &&
-    form.childForms.length > 0
-  ) {
+  if (!isOwnerTenant && !isSharedTenant && !matchesAssignedChassis && !matchesParentFormAccess && userTenantIdStr && Array.isArray(form?.childForms) && form.childForms.length > 0) {
     const childIds = form.childForms.map((cf) => cf.formId || cf.id).filter(Boolean);
     const childFormDocs = await Form.find({
       $or: [
         { id: { $in: childIds } },
-        { _id: { $in: childIds.filter((id) => mongoose.Types.ObjectId.isValid(id)) } },
-      ],
-    })
-      .select('tenantId sharedWithTenants')
-      .lean();
+        { _id: { $in: childIds.filter((id) => mongoose.Types.ObjectId.isValid(id)) } }
+      ]
+    }).select('tenantId sharedWithTenants').lean();
     matchesChildFormAccess = childFormDocs.some(
-      (cf) =>
-        (cf.tenantId && cf.tenantId.toString() === userTenantIdStr) ||
-        (Array.isArray(cf.sharedWithTenants) &&
-          cf.sharedWithTenants.some((t) => String(t?._id || t?.id || t) === userTenantIdStr))
+      (cf) => (cf.tenantId && cf.tenantId.toString() === userTenantIdStr) ||
+        (Array.isArray(cf.sharedWithTenants) && cf.sharedWithTenants.some((t) => String(t?._id || t?.id || t) === userTenantIdStr))
     );
   }
 
-  return Boolean(
-    isOwnerTenant ||
-    isSharedTenant ||
-    matchesAssignedChassis ||
-    matchesParentFormAccess ||
-    matchesChildFormAccess ||
-    matchesResponseTenant
-  );
+  return Boolean(isOwnerTenant || isSharedTenant || matchesAssignedChassis || matchesParentFormAccess || matchesChildFormAccess || matchesResponseTenant);
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Inspector Visibility Filter
-// ─────────────────────────────────────────────────────────────────────────────
-export const buildInspectorVisibilityFilter = (req, dispatchedOnly = false) => {
-  const user = req.user || {};
-  const isSuperAdmin = user.role === 'superadmin' || user.role === 'admin';
-  const tenantId = user.tenantId;
-
-  if (isSuperAdmin) return {};
-
-  const ownBranches = [
-    { createdBy: user._id },
-    user.email ? { submittedBy: user.email } : null,
-    user.username ? { submittedBy: user.username } : null,
-    user.email ? { 'submitterContact.email': user.email } : null,
-  ].filter(Boolean);
-
-  const baseOr = [
-    ...ownBranches,
-    tenantId ? { tenantId } : null,
-    tenantId ? { tenantId: { $ne: tenantId }, isDispatched: true } : null,
-  ].filter(Boolean);
-
-  if (dispatchedOnly === true || dispatchedOnly === 'true') {
-    return {
-      $and: [{ $or: baseOr }, { $or: [...ownBranches, { isDispatched: true }] }],
-    };
-  }
-
-  return { $or: baseOr };
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Robust Date Parser for Excel Imports
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── Robust Date Parser for Excel Imports ─────────────────────────────────────
+// Handles DD/MM/YYYY, DD-MM-YYYY, YYYY-MM-DD, DD-MMM-YYYY, Excel serial numbers,
+// and ISO date strings into valid Date objects.
 function parseExcelDateBackend(value) {
   if (!value && value !== 0) return undefined;
   if (value instanceof Date) {
@@ -248,6 +179,7 @@ function parseExcelDateBackend(value) {
     if (fullYear >= 30000 && fullYear <= 100000) {
       return parseExcelDateBackend(fullYear);
     }
+    // If it was read as UTC midnight from Excel, convert to safe midday UTC to prevent timezone boundary flip
     if (value.getUTCHours() === 0 && value.getUTCMinutes() === 0 && value.getUTCSeconds() === 0) {
       return new Date(Date.UTC(value.getUTCFullYear(), value.getUTCMonth(), value.getUTCDate(), 12, 0, 0));
     }
@@ -269,16 +201,22 @@ function parseExcelDateBackend(value) {
     const trimmed = value.trim();
     if (!trimmed) return undefined;
 
+    // Check if ISO string with extended 5-6 digit year (e.g. "+046364-12-31")
     const plusYearMatch = trimmed.match(/^\+0*(\d{5,6})/);
     if (plusYearMatch) {
       const serial = parseInt(plusYearMatch[1], 10);
-      if (serial >= 30000 && serial <= 100000) return parseExcelDateBackend(serial);
+      if (serial >= 30000 && serial <= 100000) {
+        return parseExcelDateBackend(serial);
+      }
     }
 
+    // Check if date formatted with 5-6 digit year (e.g. "01/01/46364")
     const fiveDigitYearMatch = trimmed.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{5,6})/);
     if (fiveDigitYearMatch) {
       const serial = parseInt(fiveDigitYearMatch[3], 10);
-      if (serial >= 30000 && serial <= 100000) return parseExcelDateBackend(serial);
+      if (serial >= 30000 && serial <= 100000) {
+        return parseExcelDateBackend(serial);
+      }
     }
 
     const numVal = Number(trimmed);
@@ -420,16 +358,21 @@ function parseExcelDateBackend(value) {
   return undefined;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Small helpers
-// ─────────────────────────────────────────────────────────────────────────────
 const extractAnswerString = (ans) => {
   if (ans === null || ans === undefined) return '';
   if (typeof ans === 'object') {
-    if (ans.chassisNumber !== undefined && ans.chassisNumber !== null) return String(ans.chassisNumber).trim();
-    if (ans.value !== undefined && ans.value !== null) return String(ans.value).trim();
-    if (ans.text !== undefined && ans.text !== null) return String(ans.text).trim();
-    if (ans.chassis !== undefined && ans.chassis !== null) return String(ans.chassis).trim();
+    if (ans.chassisNumber !== undefined && ans.chassisNumber !== null) {
+      return String(ans.chassisNumber).trim();
+    }
+    if (ans.value !== undefined && ans.value !== null) {
+      return String(ans.value).trim();
+    }
+    if (ans.text !== undefined && ans.text !== null) {
+      return String(ans.text).trim();
+    }
+    if (ans.chassis !== undefined && ans.chassis !== null) {
+      return String(ans.chassis).trim();
+    }
     return '';
   }
   return String(ans).trim();
@@ -446,15 +389,15 @@ const getRelatedFormsAndIds = async (form, baseFormId) => {
       const parentForm = await Form.findOne({
         $or: [
           { id: pStr },
-          { _id: mongoose.Types.ObjectId.isValid(pStr) ? new mongoose.Types.ObjectId(pStr) : null },
-        ].filter(Boolean),
+          { _id: mongoose.Types.ObjectId.isValid(pStr) ? new mongoose.Types.ObjectId(pStr) : null }
+        ].filter(Boolean)
       }).lean();
       if (parentForm) {
         relatedForms.push(parentForm);
         if (parentForm.id) formIds.push(parentForm.id);
         if (parentForm._id) formIds.push(parentForm._id.toString());
         if (Array.isArray(parentForm.childForms)) {
-          parentForm.childForms.forEach((cf) => {
+          parentForm.childForms.forEach(cf => {
             if (cf.formId) formIds.push(cf.formId);
           });
         }
@@ -466,13 +409,16 @@ const getRelatedFormsAndIds = async (form, baseFormId) => {
 
   try {
     const targetIds = [form.id, form._id ? form._id.toString() : null, baseFormId].filter(Boolean);
-    const parentsByChild = await Form.find({ 'childForms.formId': { $in: targetIds } }).lean();
-    parentsByChild.forEach((pf) => {
+    const parentsByChild = await Form.find({
+      'childForms.formId': { $in: targetIds }
+    }).lean();
+
+    parentsByChild.forEach(pf => {
       relatedForms.push(pf);
       if (pf.id) formIds.push(pf.id);
       if (pf._id) formIds.push(pf._id.toString());
       if (Array.isArray(pf.childForms)) {
-        pf.childForms.forEach((cf) => {
+        pf.childForms.forEach(cf => {
           if (cf.formId) formIds.push(cf.formId);
         });
       }
@@ -482,12 +428,13 @@ const getRelatedFormsAndIds = async (form, baseFormId) => {
   }
 
   if (Array.isArray(form.childForms)) {
-    form.childForms.forEach((cf) => {
+    form.childForms.forEach(cf => {
       if (cf.formId) formIds.push(cf.formId);
     });
   }
 
-  return { formIds: Array.from(new Set(formIds)), relatedForms };
+  const uniqueFormIds = Array.from(new Set(formIds));
+  return { formIds: uniqueFormIds, relatedForms };
 };
 
 const getRelatedFormIds = async (form, baseFormId) => {
@@ -496,22 +443,25 @@ const getRelatedFormIds = async (form, baseFormId) => {
 };
 
 const getThisFormIds = (form, baseFormId) => {
-  return Array.from(
-    new Set([form.id, form._id ? form._id.toString() : null, baseFormId].filter(Boolean))
-  );
+  const formIds = [
+    form.id,
+    form._id ? form._id.toString() : null,
+    baseFormId
+  ].filter(Boolean);
+  return Array.from(new Set(formIds));
 };
 
 const getThisFormExtraQuestionIds = (form) => {
   const extraQIds = [];
   const collectQ = (qs) => {
-    (qs || []).forEach((q) => {
+    (qs || []).forEach(q => {
       if (q.id) extraQIds.push(q.id);
       if (q._id) extraQIds.push(q._id.toString());
       if (q.text) extraQIds.push(q.text);
       if (q.followUpQuestions) collectQ(q.followUpQuestions);
     });
   };
-  (form.sections || []).forEach((s) => collectQ(s.questions));
+  (form.sections || []).forEach(s => collectQ(s.questions));
   collectQ(form.followUpQuestions);
   return Array.from(new Set(extraQIds));
 };
@@ -519,14 +469,12 @@ const getThisFormExtraQuestionIds = (form) => {
 const buildChassisOrConditions = (questionId, trackingQId, strAnswer, extraQuestionIds = []) => {
   const trimmed = String(strAnswer || '').trim();
   if (!trimmed) return [];
-  const possibleStrings = Array.from(
-    new Set([
-      trimmed,
-      trimmed.toLowerCase(),
-      trimmed.toUpperCase(),
-      trimmed.charAt(0).toUpperCase() + trimmed.slice(1).toLowerCase(),
-    ])
-  );
+  const possibleStrings = Array.from(new Set([
+    trimmed,
+    trimmed.toLowerCase(),
+    trimmed.toUpperCase(),
+    trimmed.charAt(0).toUpperCase() + trimmed.slice(1).toLowerCase()
+  ]));
 
   const orConditions = [
     { chassisNumber: { $in: possibleStrings } },
@@ -546,12 +494,6 @@ const buildChassisOrConditions = (questionId, trackingQId, strAnswer, extraQuest
     { 'answers.idNumber': { $in: possibleStrings } },
     { 'answers.Identification': { $in: possibleStrings } },
     { 'answers.identification': { $in: possibleStrings } },
-    { 'answers.Identification Number': { $in: possibleStrings } },
-    { 'answers.identification_number': { $in: possibleStrings } },
-    { 'answers.identificationNumber': { $in: possibleStrings } },
-    { 'answers.IDENTIFICATION NUMBER': { $in: possibleStrings } },
-    { 'answers.Identification No': { $in: possibleStrings } },
-    { 'answers.identification_no': { $in: possibleStrings } },
     { 'answers.ID number': { $in: possibleStrings } },
     { 'answers.ID Number': { $in: possibleStrings } },
     { 'answers.ID NUMBER': { $in: possibleStrings } },
@@ -562,7 +504,7 @@ const buildChassisOrConditions = (questionId, trackingQId, strAnswer, extraQuest
     { 'answers.VIN': { $in: possibleStrings } },
   ];
 
-  (extraQuestionIds || []).forEach((qId) => {
+  (extraQuestionIds || []).forEach(qId => {
     if (qId && qId !== questionId && qId !== trackingQId) {
       orConditions.push({ [`answers.${qId}`]: { $in: possibleStrings } });
       orConditions.push({ [`answers.${qId}.chassisNumber`]: { $in: possibleStrings } });
@@ -591,9 +533,7 @@ const buildChassisOrConditions = (questionId, trackingQId, strAnswer, extraQuest
   return orConditions;
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Chassis range bounds / expansion
-// ─────────────────────────────────────────────────────────────────────────────
+// ========== MODULE-LEVEL CHASSIS RANGE BOUNDS DETECTION & EXPANSION ==========
 export const extractRangeBounds = (val) => {
   if (!val) return null;
   if (typeof val === 'object') {
@@ -635,7 +575,7 @@ export const expandChassisRange = (startStr, endStr, maxLimit = 200) => {
   if (!end) return [start];
   if (start === end) return [start];
 
-  // Pure numeric
+  // 1. Pure numeric (e.g. "30" to "35" or "35" to "30")
   if (/^\d+$/.test(start) && /^\d+$/.test(end)) {
     const n1 = parseInt(start, 10);
     const n2 = parseInt(end, 10);
@@ -644,13 +584,15 @@ export const expandChassisRange = (startStr, endStr, maxLimit = 200) => {
     const count = Math.min(high - low + 1, maxLimit);
     const padLen = Math.max(start.length, end.length);
     const list = [];
+    // Descending: from high (e.g. 35) down to low (e.g. 30)
     for (let i = 0; i < count; i++) {
-      list.push(String(high - i).padStart(padLen, '0'));
+      const val = String(high - i);
+      list.push(padLen > 0 ? val.padStart(padLen, '0') : val);
     }
     return list;
   }
 
-  // Prefix + numeric suffix
+  // 2. Prefix + Numeric Suffix (e.g. "S8-VRT-30" to "S8-VRT-35" or "S8-VRT-35" to "S8-VRT-30")
   const startMatch = start.match(/^(.*?)(\d+)$/);
   const endMatch = end.match(/^(.*?)(\d+)$/);
   if (startMatch && endMatch && startMatch[1] === endMatch[1]) {
@@ -662,6 +604,7 @@ export const expandChassisRange = (startStr, endStr, maxLimit = 200) => {
     const count = Math.min(high - low + 1, maxLimit);
     const padLen = Math.max(startMatch[2].length, endMatch[2].length);
     const list = [];
+    // Descending: from high (e.g. S8-VRT-35) down to low (e.g. S8-VRT-30)
     for (let i = 0; i < count; i++) {
       const val = String(high - i).padStart(padLen, '0');
       list.push(`${prefix}${val}`);
@@ -672,65 +615,21 @@ export const expandChassisRange = (startStr, endStr, maxLimit = 200) => {
   return [end, start];
 };
 
-function formatTimeDuration(seconds) {
-  if (!seconds || seconds < 0) return '0 seconds';
-  if (seconds < 60) return `${seconds} second${seconds !== 1 ? 's' : ''}`;
-  const minutes = Math.floor(seconds / 60);
-  const remainingSeconds = seconds % 60;
-  if (minutes < 60) {
-    if (remainingSeconds === 0) return `${minutes} minute${minutes !== 1 ? 's' : ''}`;
-    return `${minutes} minute${minutes !== 1 ? 's' : ''} ${remainingSeconds} second${remainingSeconds !== 1 ? 's' : ''}`;
-  }
-  const hours = Math.floor(minutes / 60);
-  const remainingMinutes = minutes % 60;
-  if (remainingMinutes === 0) return `${hours} hour${hours !== 1 ? 's' : ''}`;
-  return `${hours} hour${hours !== 1 ? 's' : ''} ${remainingMinutes} minute${remainingMinutes !== 1 ? 's' : ''}`;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Shared sub-status inference (used by getRank / suggestions)
-// ─────────────────────────────────────────────────────────────────────────────
-const inferSubStatusFromAnswers = (answersObj) => {
-  let hasRework = false;
-  let hasReject = false;
-  for (const val of Object.values(answersObj || {})) {
-    if (val && typeof val === 'object' && val.status) {
-      const s = String(val.status).toLowerCase().trim();
-      if (s === 'rework' || s.includes('rework')) hasRework = true;
-      if (s === 'rejected' || s === 'reject') hasReject = true;
-    } else if (typeof val === 'string') {
-      const s = val.toLowerCase().trim();
-      if (s === 'rework' || s.includes('rework')) hasRework = true;
-      if (s === 'rejected' || s === 'reject') hasReject = true;
-    }
-  }
-  return { hasRework, hasReject };
-};
-
-const sanitizeAnswersForClient = (answersObj) => {
-  const out = {};
-  for (const [k, v] of Object.entries(answersObj || {})) {
-    if (typeof v === 'string') {
-      out[k] = v.startsWith('data:image') ? '' : v;
-    } else if (v && typeof v === 'object') {
-      const copy = { ...v };
-      if (typeof copy.evidenceUrl === 'string' && copy.evidenceUrl.startsWith('data:image')) {
-        copy.evidenceUrl = '';
-      }
-      out[k] = copy;
-    } else {
-      out[k] = v;
-    }
-  }
-  return out;
-};
-
-// ═════════════════════════════════════════════════════════════════════════════
-// createResponse
-// ═════════════════════════════════════════════════════════════════════════════
 export const createResponse = async (req, res) => {
   try {
     console.log('[CREATE RESPONSE] === START ===');
+    rankResultCache.clear();
+    suggestionsMemoryCache.clear();
+    console.log('[CREATE RESPONSE] req.user:', req.user);
+    console.log('[CREATE RESPONSE] req.user?._id:', req.user?._id);
+    console.log('[CREATE RESPONSE] req.user?.role:', req.user?.role);
+    console.log('[CREATE RESPONSE] req.user?.email:', req.user?.email);
+    console.log('[CREATE RESPONSE] req.user?.username:', req.user?.username);
+    console.log('[CREATE RESPONSE] auth header exists:', !!req.header('Authorization'));
+    console.log('[CREATE RESPONSE] auth header value:', req.header('Authorization')?.substring(0, 30) + '...');
+    console.log('[CREATE RESPONSE] body.submittedBy:', req.body.submittedBy);
+    console.log('[CREATE RESPONSE] body.submitterContact:', req.body.submitterContact);
+
     const {
       questionId: bodyFormId,
       answers,
@@ -743,13 +642,16 @@ export const createResponse = async (req, res) => {
       sectionIndex,
       sessionId,
       startedAt,
-      completedAt,
+      completedAt
     } = req.body;
     const { tenantSlug, formId: paramFormId } = req.params;
     const questionId = paramFormId || bodyFormId;
 
     if (!questionId) {
-      return res.status(400).json({ success: false, message: 'Form ID is required' });
+      return res.status(400).json({
+        success: false,
+        message: 'Form ID is required'
+      });
     }
 
     let form;
@@ -757,42 +659,54 @@ export const createResponse = async (req, res) => {
     let formSession = null;
     let actualStartedAt = startedAt ? new Date(startedAt) : null;
     let actualCompletedAt = completedAt ? new Date(completedAt) : new Date();
-
+    // ========== TIMING CALCULATION ==========
+    // Calculate time if we have start time
     if (actualStartedAt) {
       submissionTimeSpent = Math.floor((actualCompletedAt - actualStartedAt) / 1000);
     }
 
-    // ── Session timing ──
+    // Try to find FormSession if we have sessionId
     if (sessionId) {
       try {
-        formSession = await mongoose.model('FormSession').findOne({ sessionId });
+        const FormSession = mongoose.model('FormSession');
+        formSession = await FormSession.findOne({ sessionId });
+
         if (formSession) {
+          // Use session data for more accurate timing
           if (formSession.startedAt) {
             actualStartedAt = formSession.startedAt;
             actualCompletedAt = new Date();
             submissionTimeSpent = Math.floor((actualCompletedAt - formSession.startedAt) / 1000);
           }
+
+          // Update session as completed (only for final submission, not partial)
           if (!isSectionSubmit) {
             formSession.completedAt = actualCompletedAt;
             formSession.timeSpent = submissionTimeSpent;
             formSession.status = 'completed';
             formSession.answers = answers;
             await formSession.save();
+            console.log(`[TIME TRACKING] Session ${sessionId} completed in ${submissionTimeSpent} seconds`);
           } else {
+            // For partial submissions, just update last activity
             formSession.lastActivityAt = actualCompletedAt;
             await formSession.save();
+            console.log(`[TIME TRACKING] Partial submission for session ${sessionId}`);
           }
         }
       } catch (err) {
         console.error('Error finding FormSession:', err);
       }
     } else if (req.formSessionId) {
+      // Fallback to sessionId stored in request by trackFormStart middleware
       try {
-        formSession = await mongoose.model('FormSession').findOne({ sessionId: req.formSessionId });
+        const FormSession = mongoose.model('FormSession');
+        formSession = await FormSession.findOne({ sessionId: req.formSessionId });
         if (formSession && !isSectionSubmit) {
           actualStartedAt = formSession.startedAt;
           actualCompletedAt = new Date();
           submissionTimeSpent = Math.floor((actualCompletedAt - formSession.startedAt) / 1000);
+
           formSession.completedAt = actualCompletedAt;
           formSession.timeSpent = submissionTimeSpent;
           formSession.status = 'completed';
@@ -804,17 +718,17 @@ export const createResponse = async (req, res) => {
       }
     }
 
+    // If no session exists and this is a final submission, try to find one by matching time window
     if (!formSession && !isSectionSubmit) {
       try {
-        const recentSession = await mongoose
-          .model('FormSession')
-          .findOne({
-            formId: questionId,
-            userId: req.user?._id || null,
-            status: 'in-progress',
-            startedAt: { $gte: new Date(Date.now() - 2 * 60 * 60 * 1000) },
-          })
-          .sort({ startedAt: -1 });
+        const FormSession = mongoose.model('FormSession');
+        // Look for recent session (last 2 hours) from this user/IP
+        const recentSession = await FormSession.findOne({
+          formId: questionId,
+          userId: req.user?._id || null,
+          status: 'in-progress',
+          startedAt: { $gte: new Date(Date.now() - 2 * 60 * 60 * 1000) } // Last 2 hours
+        }).sort({ startedAt: -1 });
 
         if (recentSession) {
           submissionTimeSpent = Math.floor((new Date() - recentSession.startedAt) / 1000);
@@ -824,59 +738,137 @@ export const createResponse = async (req, res) => {
           recentSession.answers = answers;
           await recentSession.save();
           formSession = recentSession;
+          console.log(`[TIME TRACKING] Found orphaned session, time spent: ${submissionTimeSpent} seconds`);
         }
       } catch (err) {
         console.error('Error finding recent session:', err);
       }
     }
 
-    // ── Form lookup ──
+    // Log timing information
+    const formatTimeDisplay = (seconds) => {
+      if (!seconds || seconds < 60) return `${seconds || 0}s`;
+      const mins = Math.floor(seconds / 60);
+      const secs = seconds % 60;
+      return mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+    };
+
+    console.log(`[TIME TRACKING] Form submission - Time spent: ${formatTimeDisplay(submissionTimeSpent)}`);
+
+    // ========== FORM VALIDATION (Keep your existing code) ==========
+
+
+    if (!questionId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Form ID is required'
+      });
+    }
+
+    console.log(`[CREATE RESPONSE] FormID: ${questionId}, TenantSlug: ${tenantSlug || 'N/A'}`);
+    console.log(`[CREATE RESPONSE DEBUG] Step 1: Starting form lookup`);
+
+
     const searchConditions = [{ id: questionId }];
     if (mongoose.Types.ObjectId.isValid(questionId)) {
       searchConditions.push({ _id: new mongoose.Types.ObjectId(String(questionId)) }, { _id: questionId });
     }
+
     form = await Form.findOne({ $or: searchConditions });
 
     if (!form && tenantSlug) {
       const tenant = await Tenant.findOne({ slug: tenantSlug, isActive: true });
-      if (tenant) form = await Form.findOne({ $or: searchConditions, tenantId: tenant._id });
-    }
-    if (!form) {
-      return res.status(404).json({ success: false, message: `Form not found with ID: ${questionId}` });
+      if (tenant) {
+        form = await Form.findOne({ $or: searchConditions, tenantId: tenant._id });
+      }
     }
 
-    // ── Invite ──
+    if (!form) {
+      return res.status(404).json({
+        success: false,
+        message: `Form not found with ID: ${questionId}`
+      });
+    }
+
+    if (req.user && ['inspector', 'subadmin', 'user'].includes(req.user.role)) {
+      const userTenantIdStr = (req.user.tenantId?._id || req.user.tenantId)?.toString() || '';
+      const formTenantIdStr = (form.tenantId?._id || form.tenantId)?.toString() || '';
+      const isOwnTenantForm = Boolean(formTenantIdStr && userTenantIdStr && formTenantIdStr === userTenantIdStr);
+
+      if (isOwnTenantForm && (form.isHidden === true || form.isVisible === false)) {
+        return res.status(403).json({
+          success: false,
+          message: 'Access denied. This form is currently hidden by your organization administration.'
+        });
+      }
+    }
+
+    // ========== INVITE HANDLING (Keep your existing code) ==========
     let inviteStatus = null;
     let inviteObj = null;
+
     if (inviteId) {
-      inviteObj = await FormInvite.findOne({ formId: questionId, inviteId });
+      console.log(`[INVITE] Processing response with inviteId: ${inviteId}`);
+
+      const invite = await FormInvite.findOne({
+        formId: questionId,
+        inviteId: inviteId
+      });
+
+      inviteObj = invite;
+
       if (inviteObj) {
+        if (inviteObj.status === 'responded' && !isSectionSubmit) {
+          console.log(`[INVITE] Invite ${inviteId} was already responded.`);
+        }
+
         if (!isSectionSubmit) {
           inviteObj.status = 'responded';
           inviteObj.respondedAt = new Date();
-          await inviteObj.save().catch((e) => console.error('[INVITE] Error saving:', e));
+          await inviteObj.save().catch(e => console.error('[INVITE] Error saving:', e));
           inviteStatus = 'responded';
+          console.log(`[INVITE] Updated invite ${inviteId} to responded status`);
+        } else {
+          console.log(`[INVITE] Partial submission for invite ${inviteId}`);
         }
       }
     }
 
-    // ── Submission metadata ──
+    // ========== SUBMISSION METADATA (Keep your existing code) ==========
+    console.log(`[CREATE RESPONSE DEBUG] Step 4: Starting submission metadata collection`);
     const submissionMetadata = await collectSubmissionMetadata(req, {
       includeLocation: form.locationEnabled !== false,
     });
+
     if (bodyMetadata && bodyMetadata.source) {
       submissionMetadata.source = bodyMetadata.source;
     } else if (inviteId && inviteObj) {
+      // Use the already found invite object
       if (inviteObj.notificationChannels && inviteObj.notificationChannels.length > 0) {
+        // Preference 1: Use the explicit notification channel (email, sms, whatsapp)
         submissionMetadata.source = inviteObj.notificationChannels[0];
       } else if (inviteObj.phone && !inviteObj.email) {
+        // Preference 2: If only phone is present, it's likely SMS
         submissionMetadata.source = 'sms';
       } else if (inviteObj.email) {
+        // Preference 3: If email is present, it's likely Email
         submissionMetadata.source = 'email';
       } else {
+        // Fallback
         submissionMetadata.source = 'email';
       }
     }
+
+    if (bodyMetadata?.idempotencyKey || req.body?.idempotencyKey) {
+      submissionMetadata.idempotencyKey = req.body?.idempotencyKey || bodyMetadata?.idempotencyKey;
+    }
+    if (bodyMetadata?.sessionId || sessionId) {
+      submissionMetadata.sessionId = sessionId || bodyMetadata?.sessionId;
+    }
+    if (bodyMetadata?.clientProvisionalRank) {
+      submissionMetadata.clientProvisionalRank = bodyMetadata.clientProvisionalRank;
+    }
+
 
     if (form.locationEnabled !== false && req.body.location && typeof req.body.location === 'object') {
       const { latitude, longitude, accuracy, source, capturedAt, city, region, country } = req.body.location;
@@ -888,101 +880,186 @@ export const createResponse = async (req, res) => {
         city: typeof city === 'string' ? city : null,
         region: typeof region === 'string' ? region : null,
         country: typeof country === 'string' ? country : null,
-        capturedAt: capturedAt ? new Date(capturedAt) : new Date(),
+        capturedAt: capturedAt ? new Date(capturedAt) : new Date()
       };
+      console.log('[DEBUG] Captured location stored:', submissionMetadata.capturedLocation);
     }
 
-    // ── Collect questions ──
+    // Helper function to recursively collect all questions
     const collectAllQuestions = (questions, result = []) => {
       if (!Array.isArray(questions)) return result;
-      questions.forEach((q) => {
+
+      questions.forEach(q => {
         result.push(q);
-        if (Array.isArray(q.followUpQuestions)) collectAllQuestions(q.followUpQuestions, result);
+        if (Array.isArray(q.followUpQuestions)) {
+          collectAllQuestions(q.followUpQuestions, result);
+        }
       });
+
       return result;
     };
 
-    const allQuestions = [];
-    (form.sections || []).forEach((s) => collectAllQuestions(s.questions, allQuestions));
-    collectAllQuestions(form.followUpQuestions, allQuestions);
 
-    // ── Score ──
+
+    // ========== SCORE CALCULATION (Keep your existing code) ==========
+    const allQuestions = [];
+    if (form.sections) {
+      form.sections.forEach(section => {
+        if (section.questions) {
+          collectAllQuestions(section.questions, allQuestions);
+
+        }
+      });
+    }
+    if (form.followUpQuestions) {
+      collectAllQuestions(form.followUpQuestions, allQuestions);
+
+    }
+
     let correct = 0;
     let total = 0;
-    allQuestions.forEach((question) => {
+    const questionResults = {};
+
+    allQuestions.forEach(question => {
       if (question.type === 'yesNoNA') {
         total++;
         const answer = answers[question.id];
-        if (answer && String(answer).toLowerCase() === 'yes') correct++;
+        let isCorrect = false;
+
+        if (answer && String(answer).toLowerCase() === 'yes') {
+          isCorrect = true;
+          correct++;
+        }
+
+        questionResults[question.id] = {
+          isCorrect,
+          userAnswer: answer,
+          questionType: 'yesNoNA',
+          scoring: { yes: 1, no: 0, nOrNA: 0 }
+        };
       } else {
-        const hasCorrectAnswer =
-          question.correctAnswer || (question.correctAnswers && question.correctAnswers.length > 0);
+        const hasCorrectAnswer = question.correctAnswer || (question.correctAnswers && question.correctAnswers.length > 0);
+
         if (hasCorrectAnswer) {
           total++;
           const answer = answers[question.id];
           let isCorrect = false;
+
           if (question.correctAnswers && question.correctAnswers.length > 0) {
             if (Array.isArray(answer)) {
-              const na = answer.map((a) => String(a).toLowerCase());
-              const nc = question.correctAnswers.map((a) => String(a).toLowerCase());
-              isCorrect = na.length === nc.length && na.every((a) => nc.includes(a));
+              const normalizedAnswer = answer.map(a => String(a).toLowerCase());
+              const normalizedCorrect = question.correctAnswers.map(a => String(a).toLowerCase());
+              isCorrect = normalizedAnswer.length === normalizedCorrect.length &&
+                normalizedAnswer.every(a => normalizedCorrect.includes(a));
             } else {
-              isCorrect = question.correctAnswers.map((a) => String(a).toLowerCase()).includes(String(answer).toLowerCase());
+              const normalizedAnswer = String(answer).toLowerCase();
+              const normalizedCorrect = question.correctAnswers.map(a => String(a).toLowerCase());
+              isCorrect = normalizedCorrect.includes(normalizedAnswer);
             }
           } else if (question.correctAnswer) {
             if (Array.isArray(answer)) {
-              isCorrect = answer.some((a) => String(a).toLowerCase() === String(question.correctAnswer).toLowerCase());
+              isCorrect = answer.some(a => String(a).toLowerCase() === String(question.correctAnswer).toLowerCase());
             } else {
               isCorrect = String(answer).toLowerCase() === String(question.correctAnswer).toLowerCase();
             }
           }
-          if (isCorrect) correct++;
+
+          if (isCorrect) {
+            correct++;
+          }
+
+          questionResults[question.id] = {
+            isCorrect,
+            userAnswer: answer,
+            correctAnswer: question.correctAnswers || [question.correctAnswer]
+          };
         }
       }
     });
 
-    // ── Rank calc ──
+    // Calculate ranks for specific questions
     const responseRanks = {};
     const formObj = form.toObject();
     const allQs = [];
+
+    // Recursive helper to collect all questions (used ONLY for initial collection)
     const collectFromQuestions = (questions) => {
       if (!Array.isArray(questions)) return;
-      questions.forEach((q) => {
+      questions.forEach(q => {
         allQs.push(q);
-        if (Array.isArray(q.followUpQuestions)) collectFromQuestions(q.followUpQuestions);
+        if (Array.isArray(q.followUpQuestions)) {
+          collectFromQuestions(q.followUpQuestions);
+        }
       });
     };
-    (formObj.sections || []).forEach((s) => collectFromQuestions(s.questions));
-    collectFromQuestions(formObj.followUpQuestions);
+    if (formObj.sections) {
+      formObj.sections.forEach(section => {
+        if (section.questions) {
+          collectFromQuestions(section.questions);
+        }
+      });
+    }
+    if (formObj.followUpQuestions) {
+      collectFromQuestions(formObj.followUpQuestions);
+    }
 
+    // Separate helper that collects question IDs WITHOUT mutating allQs
+    const collectExtraQuestionIds = (questions) => {
+      const ids = [];
+      if (!Array.isArray(questions)) return ids;
+      questions.forEach(q => {
+        if (q.id) ids.push(q.id);
+        if (q._id) ids.push(q._id.toString());
+        if (Array.isArray(q.followUpQuestions)) {
+          ids.push(...collectExtraQuestionIds(q.followUpQuestions));
+        }
+      });
+      return ids;
+    };
+
+    // Filter to only tracking-enabled questions and deduplicate by ID
     const processedQIds = new Set();
-    const trackingQuestions = allQs.filter((q) => {
+    const trackingQuestions = allQs.filter(q => {
       const qId = q.id;
       if (!qId || processedQIds.has(qId)) return false;
       const isTracking =
         q.trackResponseRank === true ||
-        q.trackResponseRank === 'true' ||
+        q.trackResponseRank === "true" ||
         q.trackResponseQuestion === true ||
-        q.trackResponseQuestion === 'true';
+        q.trackResponseQuestion === "true";
       if (isTracking) processedQIds.add(qId);
       return isTracking;
     });
 
+    console.log(`[RANK] ${allQs.length} questions in form, ${trackingQuestions.length} with tracking enabled`);
+
     if (trackingQuestions.length > 0) {
+      // Scope rank stamping strictly to this form alone
       const formIds = getThisFormIds(form, questionId);
       const extraQIds = getThisFormExtraQuestionIds(form);
+
+      // Build and run all rank queries in parallel
       const rankPromises = trackingQuestions.map(async (question) => {
         const qId = question.id;
         const trackingQId = `${qId}_tracking`;
         const rawAns = answers[qId] !== undefined ? answers[qId] : answers[trackingQId];
         const strAnswer = extractAnswerString(rawAns);
-        if (strAnswer === '') return;
+
+        if (strAnswer === "") return;
+
         const orConditions = buildChassisOrConditions(qId, trackingQId, strAnswer, extraQIds);
+
         const query = {
-          $or: [{ questionId: { $in: formIds } }, { formId: { $in: formIds } }],
-          $and: [{ $or: orConditions }],
-          isSectionSubmit: { $ne: true },
+          $or: [
+            { questionId: { $in: formIds } },
+            { formId: { $in: formIds } }
+          ],
+          $and: [
+            { $or: orConditions }
+          ],
+          isSectionSubmit: { $ne: true }
         };
+
         try {
           const count = await Response.countDocuments(query);
           responseRanks[qId] = count + 1;
@@ -990,22 +1067,32 @@ export const createResponse = async (req, res) => {
           console.error(`[RANK ERROR] Failed to count for question ${qId}:`, countError);
         }
       });
+
       await Promise.all(rankPromises);
+      console.log(`[RANK] Completed rank calculation for ${trackingQuestions.length} questions`);
     }
 
-    // ── Display name ──
+
     let displayName = 'Anonymous';
+
     if (req.body.submittedBy && req.body.submittedBy !== 'Anonymous') {
       displayName = req.body.submittedBy;
     } else if (req.user) {
+      // Try to get full name from firstName + lastName
       if (req.user.firstName || req.user.lastName) {
         displayName = `${req.user.firstName || ''} ${req.user.lastName || ''}`.trim();
       }
-      if (displayName === '' && req.user.username) displayName = req.user.username;
-      if (displayName === '' && req.user.email) displayName = req.user.email;
+      // Fallback to username
+      if (displayName === '' && req.user.username) {
+        displayName = req.user.username;
+      }
+      // Fallback to email
+      if (displayName === '' && req.user.email) {
+        displayName = req.user.email;
+      }
     }
 
-    // ── Chassis extraction ──
+    // Extract chassis number from answers or form configuration
     let chassisVal = extractAnswerString(
       answers?.chassis_number ||
       answers?.selected_chassis ||
@@ -1021,13 +1108,14 @@ export const createResponse = async (req, res) => {
     );
 
     const configuredFormChassis = (form?.chassisNumbers || [])
-      .map((c) => (typeof c === 'string' ? c : c.chassisNumber || c.name))
+      .map(c => typeof c === 'string' ? c : (c.chassisNumber || c.name))
       .filter(Boolean);
 
     if (configuredFormChassis.length > 0) {
       if (chassisVal && !configuredFormChassis.includes(chassisVal)) {
+        // If chassisVal does not match configured chassis, check if answers has a match
         const matchingAnswer = Object.values(answers || {}).find(
-          (v) => typeof v === 'string' && configuredFormChassis.includes(v.trim())
+          v => typeof v === 'string' && configuredFormChassis.includes(v.trim())
         );
         if (matchingAnswer) {
           chassisVal = typeof matchingAnswer === 'string' ? matchingAnswer.trim() : matchingAnswer;
@@ -1038,12 +1126,12 @@ export const createResponse = async (req, res) => {
         chassisVal = configuredFormChassis[0];
       }
     } else if (!chassisVal) {
-      for (const q of allQuestions) {
-        if (
-          q.trackResponseRank ||
-          q.type === 'chassisNumber' ||
-          (q.text && q.text.toLowerCase().includes('chassis') && !q.text.toLowerCase().includes('zone'))
-        ) {
+      // Form has no configured chassis, check for chassis question or tracking question
+      const allFormQuestions = [];
+      (form?.sections || []).forEach(s => (s.questions || []).forEach(q => allFormQuestions.push(q)));
+      (form?.followUpQuestions || []).forEach(q => allFormQuestions.push(q));
+      for (const q of allFormQuestions) {
+        if (q.trackResponseRank || q.type === 'chassisNumber' || (q.text && q.text.toLowerCase().includes('chassis') && !q.text.toLowerCase().includes('zone'))) {
           const qVal = extractAnswerString(answers?.[q.id] || answers?.[`${q.id}_tracking`]);
           if (qVal) {
             chassisVal = qVal;
@@ -1052,17 +1140,18 @@ export const createResponse = async (req, res) => {
         }
       }
     }
+
     if (chassisVal && answers && !answers.chassis_number) {
       answers.chassis_number = chassisVal;
     }
 
-    // ── Range detection ──
     let detectedRange = null;
     let rangeQuestionKey = null;
+
     if (answers && typeof answers === 'object') {
       const priorityKeys = [
         'chassis_number', 'chassisNumber', 'ID number', 'id_number', 'idNumber',
-        'selected_chassis', 'selectedChassis', 'Identification Number', 'identification_number',
+        'selected_chassis', 'selectedChassis', 'Identification Number', 'identification_number'
       ];
       for (const pk of priorityKeys) {
         if (answers[pk] !== undefined) {
@@ -1074,14 +1163,14 @@ export const createResponse = async (req, res) => {
           }
         }
       }
+
       if (!detectedRange) {
-        for (const q of allQuestions) {
-          const rawQVal =
-            answers[q.id] !== undefined
-              ? answers[q.id]
-              : answers[q.text] !== undefined
-                ? answers[q.text]
-                : answers[`${q.id}_tracking`];
+        const allFormQuestions = [];
+        (form?.sections || []).forEach(s => (s.questions || []).forEach(q => allFormQuestions.push(q)));
+        (form?.followUpQuestions || []).forEach(q => allFormQuestions.push(q));
+
+        for (const q of allFormQuestions) {
+          const rawQVal = answers[q.id] !== undefined ? answers[q.id] : (answers[q.text] !== undefined ? answers[q.text] : answers[`${q.id}_tracking`]);
           const r = extractRangeBounds(rawQVal);
           if (r && r.start && r.end) {
             detectedRange = r;
@@ -1090,6 +1179,7 @@ export const createResponse = async (req, res) => {
           }
         }
       }
+
       if (!detectedRange) {
         for (const [key, val] of Object.entries(answers)) {
           const r = extractRangeBounds(val);
@@ -1101,6 +1191,7 @@ export const createResponse = async (req, res) => {
         }
       }
     }
+
     if (!detectedRange && chassisVal) {
       detectedRange = extractRangeBounds(chassisVal);
     }
@@ -1111,13 +1202,16 @@ export const createResponse = async (req, res) => {
       if (chassisRangeList.length > 0) {
         if (!configuredFormChassis.length || !configuredFormChassis.includes(chassisVal)) {
           chassisVal = chassisRangeList[0];
-          if (answers) answers.chassis_number = chassisVal;
+          if (answers) {
+            answers.chassis_number = chassisVal;
+          }
         }
       }
     }
 
-    // ── Parent auto-link ──
+
     let resolvedParentResponseId = parentResponseId;
+    // Auto-match to parent response by chassis if form is a child/follow-up form and parentResponseId was not passed
     if (!resolvedParentResponseId && form?.parentFormId && chassisVal) {
       try {
         const parentConditions = [{ id: form.parentFormId }];
@@ -1125,9 +1219,7 @@ export const createResponse = async (req, res) => {
           parentConditions.push({ _id: form.parentFormId });
         }
         const parentFormDoc = await Form.findOne({ $or: parentConditions }).lean();
-        const parentFormIds = [form.parentFormId.toString()].concat(
-          parentFormDoc ? [parentFormDoc.id, parentFormDoc._id?.toString()].filter(Boolean) : []
-        );
+        const parentFormIds = [form.parentFormId.toString()].concat(parentFormDoc ? [parentFormDoc.id, parentFormDoc._id?.toString()].filter(Boolean) : []);
         const orConditions = [
           { chassisNumber: chassisVal },
           { 'answers.chassis_number': chassisVal },
@@ -1140,16 +1232,14 @@ export const createResponse = async (req, res) => {
           { 'answers.ID number': chassisVal },
           { 'answers.Chassis / VIN': chassisVal },
           { 'answers.Chassis No': chassisVal },
-          { 'answers.CHASSIS NUMBER': chassisVal },
+          { 'answers.CHASSIS NUMBER': chassisVal }
         ];
         if (parentFormDoc) {
-          (parentFormDoc.sections || []).forEach((s) =>
-            (s.questions || []).forEach((q) => {
-              orConditions.push({ [`answers.${q.id}`]: chassisVal });
-              if (q.text) orConditions.push({ [`answers.${q.text}`]: chassisVal });
-            })
-          );
-          (parentFormDoc.followUpQuestions || []).forEach((q) => {
+          (parentFormDoc.sections || []).forEach(s => (s.questions || []).forEach(q => {
+            orConditions.push({ [`answers.${q.id}`]: chassisVal });
+            if (q.text) orConditions.push({ [`answers.${q.text}`]: chassisVal });
+          }));
+          (parentFormDoc.followUpQuestions || []).forEach(q => {
             orConditions.push({ [`answers.${q.id}`]: chassisVal });
             if (q.text) orConditions.push({ [`answers.${q.text}`]: chassisVal });
           });
@@ -1157,10 +1247,8 @@ export const createResponse = async (req, res) => {
         const parentResp = await Response.findOne({
           questionId: { $in: parentFormIds },
           isSectionSubmit: { $ne: true },
-          $or: orConditions,
-        })
-          .sort({ createdAt: -1 })
-          .lean();
+          $or: orConditions
+        }).sort({ createdAt: -1 }).lean();
         if (parentResp) {
           resolvedParentResponseId = parentResp.id || (parentResp._id ? parentResp._id.toString() : null);
         }
@@ -1169,53 +1257,73 @@ export const createResponse = async (req, res) => {
       }
     }
 
-    // ── Duplicate guards ──
+    // ========== DUPLICATE SUBMISSION PREVENTION ==========
     const isDuplicateConfirmed = req.body?.confirmDuplicate === true || req.body?.confirmDuplicateChassis === true;
-    const targetSessionId = isDuplicateConfirmed ? null : sessionId || formSession?.sessionId;
-    if (targetSessionId && !isSectionSubmit) {
+    const targetSessionId = isDuplicateConfirmed ? null : (sessionId || formSession?.sessionId);
+    const targetIdempotencyKey = isDuplicateConfirmed ? null : (req.body?.idempotencyKey || bodyMetadata?.idempotencyKey);
+
+    if ((targetSessionId || targetIdempotencyKey) && !isSectionSubmit) {
+      const orConditions = [];
+      if (targetSessionId) {
+        orConditions.push(
+          { sessionId: targetSessionId },
+          { 'submissionMetadata.sessionId': targetSessionId },
+          { 'submissionMetadata.idempotencyKey': targetSessionId }
+        );
+      }
+      if (targetIdempotencyKey) {
+        orConditions.push(
+          { sessionId: targetIdempotencyKey },
+          { 'submissionMetadata.sessionId': targetIdempotencyKey },
+          { 'submissionMetadata.idempotencyKey': targetIdempotencyKey }
+        );
+      }
       const existingSessionResponse = await Response.findOne({
         questionId,
-        $or: [{ sessionId: targetSessionId }, { 'submissionMetadata.sessionId': targetSessionId }],
+        $or: orConditions
       });
       if (existingSessionResponse) {
-        const existingAnswers =
-          existingSessionResponse.answers instanceof Map
-            ? Object.fromEntries(existingSessionResponse.answers)
-            : existingSessionResponse.answers;
+        console.log(`[CREATE RESPONSE] Duplicate submission blocked: sessionId/idempotencyKey ${targetSessionId || targetIdempotencyKey} already submitted as response ${existingSessionResponse.id}`);
+        const existingAnswers = existingSessionResponse.answers instanceof Map ? Object.fromEntries(existingSessionResponse.answers) : existingSessionResponse.answers;
         return res.status(200).json({
           success: true,
           message: 'Response already submitted successfully',
-          data: { response: { ...existingSessionResponse.toObject(), answers: existingAnswers } },
+          data: {
+            response: {
+              ...existingSessionResponse.toObject(),
+              answers: existingAnswers
+            }
+          }
         });
       }
     }
 
-    // Rapid duplicate (50s) guard from file 2
-    if (!isDuplicateConfirmed && chassisVal && !isSectionSubmit) {
-      const recentWindow = new Date(Date.now() - 50 * 1000);
-      const duplicateFilter = {
+    // Guard against rapid duplicate submission for the same chassis (<60s)
+    if (chassisVal && chassisVal.length >= 3 && !isDuplicateConfirmed && !isSectionSubmit) {
+      const oneMinuteAgo = new Date(Date.now() - 60 * 1000);
+      const recentChassisDuplicate = await Response.findOne({
         questionId,
         chassisNumber: chassisVal,
-        createdAt: { $gte: recentWindow },
-        isSectionSubmit: { $ne: true },
-      };
-      if (req.user?._id) duplicateFilter.createdBy = req.user._id;
-      else if (displayName && displayName !== 'Anonymous') duplicateFilter.submittedBy = displayName;
-
-      const recentDuplicate = await Response.findOne(duplicateFilter);
-      if (recentDuplicate) {
-        const dupAnswers =
-          recentDuplicate.answers instanceof Map
-            ? Object.fromEntries(recentDuplicate.answers)
-            : recentDuplicate.answers;
+        createdAt: { $gte: oneMinuteAgo }
+      });
+      if (recentChassisDuplicate) {
+        console.log(`[CREATE RESPONSE] Duplicate submission blocked for chassis ${chassisVal} (submitted <60s ago): response ${recentChassisDuplicate.id}`);
+        const existingAnswers = recentChassisDuplicate.answers instanceof Map ? Object.fromEntries(recentChassisDuplicate.answers) : recentChassisDuplicate.answers;
         return res.status(200).json({
           success: true,
           message: 'Response already submitted successfully',
-          data: { response: { ...recentDuplicate.toObject(), answers: dupAnswers } },
+          data: {
+            response: {
+              ...recentChassisDuplicate.toObject(),
+              answers: existingAnswers
+            }
+          }
         });
       }
     }
 
+    // Rapid double-click guard removed in favor of user confirmation popup
+    // ========== CREATE RESPONSE IMMEDIATELY FOR SUPER FAST SUBMISSION ==========
     const responseData = {
       id: uuidv4(),
       questionId,
@@ -1223,38 +1331,47 @@ export const createResponse = async (req, res) => {
       responseRanks: new Map(Object.entries(responseRanks || {})),
       driveBackupUrls: {},
       imageProcessing: {
-        totalImages: 0, processedImages: 0, driveBackups: 0,
-        folderStructure: null, processingTime: 0, status: 'completed',
+        totalImages: 0,
+        processedImages: 0,
+        driveBackups: 0,
+        folderStructure: null,
+        processingTime: 0,
+        status: 'completed'
       },
       parentResponseId: resolvedParentResponseId || undefined,
       chassisNumber: chassisVal || undefined,
       submittedBy: displayName,
       submitterContact: {
         email: req.body.submitterContact?.email || req.user?.email,
-        phone: req.body.submitterContact?.phone,
+        phone: req.body.submitterContact?.phone
       },
+
+      // ========== ADD TOP-LEVEL TIMING FIELDS ==========
       timeSpent: submissionTimeSpent,
       sessionId: sessionId || formSession?.sessionId || null,
       startedAt: actualStartedAt,
       completedAt: actualCompletedAt,
       questionTimings: formSession?.questionTimings || [],
+
       submissionMetadata: {
         ...submissionMetadata,
+        idempotencyKey: targetIdempotencyKey || null,
         timeSpent: submissionTimeSpent,
-        sessionId: sessionId || formSession?.sessionId || null,
+        sessionId: targetSessionId || sessionId || formSession?.sessionId || null,
         startedAt: actualStartedAt,
         completedAt: actualCompletedAt,
         timeSpentFormatted: formatTimeDuration(submissionTimeSpent),
         questionTimings: formSession?.questionTimings,
-        sectionTimings: formSession?.sectionTimings,
+        sectionTimings: formSession?.sectionTimings
       },
+
       status: 'pending',
       createdBy: req.user?._id || null,
       isSectionSubmit: !!isSectionSubmit,
       sectionIndex: sectionIndex || null,
       tenantId: form.tenantId,
       score: { correct, total },
-      inviteId: inviteId || null,
+      inviteId: inviteId || null
     };
 
     let primaryResponse = null;
@@ -1263,18 +1380,24 @@ export const createResponse = async (req, res) => {
 
     if (chassisRangeList && chassisRangeList.length > 1) {
       rangeBatchId = `range-${Date.now()}`;
-      const baseNow = Date.now();
+      console.log(`[CHASSIS RANGE] Creating ${chassisRangeList.length} responses for range ${chassisRangeList[0]} down to ${chassisRangeList[chassisRangeList.length - 1]} with batchId ${rangeBatchId}`);
 
+      const baseNow = Date.now();
+      const allFormQuestions = [];
+      (form?.sections || []).forEach(s => (s.questions || []).forEach(q => allFormQuestions.push(q)));
+      (form?.followUpQuestions || []).forEach(q => allFormQuestions.push(q));
+
+      // Pre-load parent form definition once for range unit parent matching
       let parentFormDoc = null;
       let parentFormIds = [];
       if (form?.parentFormId) {
         try {
           const parentConditions = [{ id: form.parentFormId }];
-          if (mongoose.Types.ObjectId.isValid(form.parentFormId)) parentConditions.push({ _id: form.parentFormId });
+          if (mongoose.Types.ObjectId.isValid(form.parentFormId)) {
+            parentConditions.push({ _id: form.parentFormId });
+          }
           parentFormDoc = await Form.findOne({ $or: parentConditions }).lean();
-          parentFormIds = [form.parentFormId.toString()].concat(
-            parentFormDoc ? [parentFormDoc.id, parentFormDoc._id?.toString()].filter(Boolean) : []
-          );
+          parentFormIds = [form.parentFormId.toString()].concat(parentFormDoc ? [parentFormDoc.id, parentFormDoc._id?.toString()].filter(Boolean) : []);
         } catch (pfErr) {
           console.warn('[CREATE RANGE] Error loading parent form:', pfErr);
         }
@@ -1283,23 +1406,29 @@ export const createResponse = async (req, res) => {
       for (let i = 0; i < chassisRangeList.length; i++) {
         const currentChassis = chassisRangeList[i];
         const clonedAnswers = { ...(answers || {}) };
-        const finalChassisNumber =
-          configuredFormChassis.length > 0 && configuredFormChassis.includes(chassisVal)
-            ? chassisVal
-            : currentChassis;
 
-        if (rangeQuestionKey) clonedAnswers[rangeQuestionKey] = currentChassis;
+        // Determine if system chassis should be preserved (e.g. 'TVS') or use currentChassis
+        const finalChassisNumber = (configuredFormChassis.length > 0 && configuredFormChassis.includes(chassisVal))
+          ? chassisVal
+          : currentChassis;
 
-        for (const q of allQuestions) {
+        // 1. Explicitly stamp the range question
+        if (rangeQuestionKey) {
+          clonedAnswers[rangeQuestionKey] = currentChassis;
+        }
+
+        // 2. Stamp all questions tracking chassis or identification number or matching text
+        for (const q of allFormQuestions) {
           if (
             q.id === rangeQuestionKey ||
             q.type === 'range' ||
             q.type === 'chassisNumber' ||
             q.trackResponseRank ||
-            (q.text &&
-              (q.text.toLowerCase().includes('chassis') ||
-                q.text.toLowerCase().includes('identification') ||
-                q.text.toLowerCase().includes('id number')))
+            (q.text && (
+              q.text.toLowerCase().includes('chassis') ||
+              q.text.toLowerCase().includes('identification') ||
+              q.text.toLowerCase().includes('id number')
+            ))
           ) {
             if (clonedAnswers[q.id] !== undefined || q.id === rangeQuestionKey) {
               clonedAnswers[q.id] = currentChassis;
@@ -1310,17 +1439,26 @@ export const createResponse = async (req, res) => {
           }
         }
 
+        // 3. Keep common identification keys aligned
         if (clonedAnswers['ID number'] !== undefined) clonedAnswers['ID number'] = currentChassis;
         if (clonedAnswers.id_number !== undefined) clonedAnswers.id_number = currentChassis;
         if (clonedAnswers.idNumber !== undefined) clonedAnswers.idNumber = currentChassis;
         if (clonedAnswers['Identification Number'] !== undefined) clonedAnswers['Identification Number'] = currentChassis;
         if (clonedAnswers.identification_number !== undefined) clonedAnswers.identification_number = currentChassis;
         if (clonedAnswers.identificationNumber !== undefined) clonedAnswers.identificationNumber = currentChassis;
-        clonedAnswers.chassis_number = finalChassisNumber;
+        if (finalChassisNumber !== currentChassis) {
+          clonedAnswers.chassis_number = finalChassisNumber;
+        } else {
+          clonedAnswers.chassis_number = currentChassis;
+        }
 
-        const offsetSeconds = chassisRangeList.length - i;
+        // 4. Timestamp calculation:
+        // element 0 (high, e.g. S8-VRT-35) gets highest createdAt timestamp
+        // so MongoDB query with .sort({ createdAt: -1 }) guarantees descending display 35 -> 30 in table!
+        const offsetSeconds = (chassisRangeList.length - i);
         const itemCreatedAt = new Date(baseNow + offsetSeconds * 1000);
 
+        // Auto-match parent response for each unit in the range if this is a follow-up form
         let itemParentResponseId = resolvedParentResponseId;
         if (!itemParentResponseId && form?.parentFormId && currentChassis) {
           try {
@@ -1336,16 +1474,14 @@ export const createResponse = async (req, res) => {
               { 'answers.ID number': currentChassis },
               { 'answers.Chassis / VIN': currentChassis },
               { 'answers.Chassis No': currentChassis },
-              { 'answers.CHASSIS NUMBER': currentChassis },
+              { 'answers.CHASSIS NUMBER': currentChassis }
             ];
             if (parentFormDoc) {
-              (parentFormDoc.sections || []).forEach((s) =>
-                (s.questions || []).forEach((q) => {
-                  orConditions.push({ [`answers.${q.id}`]: currentChassis });
-                  if (q.text) orConditions.push({ [`answers.${q.text}`]: currentChassis });
-                })
-              );
-              (parentFormDoc.followUpQuestions || []).forEach((q) => {
+              (parentFormDoc.sections || []).forEach(s => (s.questions || []).forEach(q => {
+                orConditions.push({ [`answers.${q.id}`]: currentChassis });
+                if (q.text) orConditions.push({ [`answers.${q.text}`]: currentChassis });
+              }));
+              (parentFormDoc.followUpQuestions || []).forEach(q => {
                 orConditions.push({ [`answers.${q.id}`]: currentChassis });
                 if (q.text) orConditions.push({ [`answers.${q.text}`]: currentChassis });
               });
@@ -1353,10 +1489,8 @@ export const createResponse = async (req, res) => {
             const pUnit = await Response.findOne({
               questionId: { $in: parentFormIds },
               isSectionSubmit: { $ne: true },
-              $or: orConditions,
-            })
-              .sort({ createdAt: -1 })
-              .lean();
+              $or: orConditions
+            }).sort({ createdAt: -1 }).lean();
             if (pUnit) {
               itemParentResponseId = pUnit.id || (pUnit._id ? pUnit._id.toString() : null);
             }
@@ -1374,19 +1508,15 @@ export const createResponse = async (req, res) => {
           createdAt: itemCreatedAt,
           timestamp: itemCreatedAt.toISOString(),
           submittedAt: itemCreatedAt,
-          answers: new Map(Object.entries(clonedAnswers)),
+          answers: new Map(Object.entries(clonedAnswers))
         };
 
         const respDoc = new Response(singleRespData);
         await respDoc.save({ timestamps: false });
         createdResponses.push(respDoc);
 
-        const singleAnswersObj =
-          respDoc.answers instanceof Map ? Object.fromEntries(respDoc.answers) : respDoc.answers;
-        const ranksObj =
-          respDoc.responseRanks instanceof Map
-            ? Object.fromEntries(respDoc.responseRanks)
-            : respDoc.responseRanks;
+        const singleAnswersObj = respDoc.answers instanceof Map ? Object.fromEntries(respDoc.answers) : respDoc.answers;
+        const ranksObj = respDoc.responseRanks instanceof Map ? Object.fromEntries(respDoc.responseRanks) : respDoc.responseRanks;
         const singlePayload = {
           id: respDoc.id,
           questionId: respDoc.questionId,
@@ -1399,8 +1529,12 @@ export const createResponse = async (req, res) => {
           responseRanks: ranksObj,
         };
         emitResponseCreated(questionId, singlePayload);
-        if (form?._id && String(form._id) !== String(questionId)) emitResponseCreated(String(form._id), singlePayload);
-        if (form?.id && String(form.id) !== String(questionId)) emitResponseCreated(String(form.id), singlePayload);
+        if (form?._id && String(form._id) !== String(questionId)) {
+          emitResponseCreated(String(form._id), singlePayload);
+        }
+        if (form?.id && String(form.id) !== String(questionId)) {
+          emitResponseCreated(String(form.id), singlePayload);
+        }
       }
       primaryResponse = createdResponses[0];
     } else {
@@ -1410,9 +1544,9 @@ export const createResponse = async (req, res) => {
       createdResponses = [response];
 
       const answersObj = response.answers instanceof Map ? Object.fromEntries(response.answers) : response.answers;
-      const ranksObj =
-        response.responseRanks instanceof Map ? Object.fromEntries(response.responseRanks) : response.responseRanks;
+      const ranksObj = response.responseRanks instanceof Map ? Object.fromEntries(response.responseRanks) : response.responseRanks;
 
+      // Emit real-time event for new response
       const livePayload = {
         id: response.id,
         questionId: response.questionId,
@@ -1425,33 +1559,25 @@ export const createResponse = async (req, res) => {
         responseRanks: ranksObj,
       };
       emitResponseCreated(questionId, livePayload);
-      if (form?._id && String(form._id) !== String(questionId)) emitResponseCreated(String(form._id), livePayload);
-      if (form?.id && String(form.id) !== String(questionId)) emitResponseCreated(String(form.id), livePayload);
-    }
-
-    // ── Invalidate caches on write ──
-    clearRankCache(questionId);
-    clearRankCache(form?.id);
-    try {
-      if (typeof invalidateCache === 'function') invalidateCache(questionId);
-    } catch (e) {
-      /* cache util may not accept this key — safe to ignore */
+      if (form?._id && String(form._id) !== String(questionId)) {
+        emitResponseCreated(String(form._id), livePayload);
+      }
+      if (form?.id && String(form.id) !== String(questionId)) {
+        emitResponseCreated(String(form.id), livePayload);
+      }
     }
 
     const finalResponse = primaryResponse;
     const answersObj = finalResponse.answers instanceof Map ? Object.fromEntries(finalResponse.answers) : finalResponse.answers;
-    const ranksObj =
-      finalResponse.responseRanks instanceof Map
-        ? Object.fromEntries(finalResponse.responseRanks)
-        : finalResponse.responseRanks;
+    const ranksObj = finalResponse.responseRanks instanceof Map ? Object.fromEntries(finalResponse.responseRanks) : finalResponse.responseRanks;
 
-    // ── Background drive backup ──
-    const driveConfigured = !!(
-      process.env.GOOGLE_DRIVE_CLIENT_ID &&
+    // Check OAuth configuration for non-blocking background drive upload
+    const driveConfigured = !!(process.env.GOOGLE_DRIVE_CLIENT_ID &&
       process.env.GOOGLE_DRIVE_CLIENT_SECRET &&
-      process.env.GOOGLE_DRIVE_REFRESH_TOKEN
-    );
+      process.env.GOOGLE_DRIVE_REFRESH_TOKEN);
+
     if (driveConfigured) {
+      // Run Drive backup in background without blocking response submission
       setImmediate(async () => {
         try {
           const metadata = {
@@ -1459,9 +1585,14 @@ export const createResponse = async (req, res) => {
             formId: questionId,
             submissionId: `resp-${Date.now()}`,
             submissionTimestamp: Date.now(),
-            driveEnabled: true,
+            driveEnabled: true
           };
-          const processingResult = await processResponseImages(answers, metadata, null, `response-${Date.now()}`);
+          const processingResult = await processResponseImages(
+            answers,
+            metadata,
+            null,
+            `response-${Date.now()}`
+          );
           if (processingResult && processingResult.processedAnswers) {
             await Response.updateOne(
               { id: finalResponse.id },
@@ -1475,9 +1606,9 @@ export const createResponse = async (req, res) => {
                     driveBackups: processingResult.stats?.successfulDriveBackups || 0,
                     folderStructure: processingResult.folderStructure || null,
                     processingTime: Date.now() - (processingResult.stats?.startTime || Date.now()),
-                    status: processingResult.error ? 'partial' : 'completed',
-                  },
-                },
+                    status: processingResult.error ? 'partial' : 'completed'
+                  }
+                }
               }
             );
           }
@@ -1487,12 +1618,12 @@ export const createResponse = async (req, res) => {
       });
     }
 
+    // ========== RETURN RESPONSE IMMEDIATELY (<100ms) ==========
     res.status(201).json({
       success: true,
-      message:
-        createdResponses.length > 1
-          ? `Successfully created ${createdResponses.length} responses for chassis range ${chassisRangeList[0]} to ${chassisRangeList[chassisRangeList.length - 1]}`
-          : 'Response submitted successfully',
+      message: createdResponses.length > 1
+        ? `Successfully created ${createdResponses.length} responses for chassis range ${chassisRangeList[0]} to ${chassisRangeList[chassisRangeList.length - 1]}`
+        : 'Response submitted successfully',
       data: {
         response: {
           id: finalResponse.id,
@@ -1507,72 +1638,117 @@ export const createResponse = async (req, res) => {
           createdAt: finalResponse.createdAt,
           updatedAt: finalResponse.updatedAt,
           inviteId: inviteId || null,
-          imageProcessing: { totalImages: 0, driveBackups: 0, folderPath: null },
+          imageProcessing: {
+            totalImages: 0,
+            driveBackups: 0,
+            folderPath: null
+          },
           timeSpent: submissionTimeSpent,
           timeSpentFormatted: formatTimeDuration(submissionTimeSpent),
           startedAt: actualStartedAt,
           completedAt: actualCompletedAt,
           questionTimings: formSession?.questionTimings,
-          sectionTimings: formSession?.sectionTimings,
+          sectionTimings: formSession?.sectionTimings
         },
         count: createdResponses.length,
         batchId: rangeBatchId || undefined,
-        responses: createdResponses.map((r) => ({ id: r.id, chassisNumber: r.chassisNumber })),
+        responses: createdResponses.map(r => ({ id: r.id, chassisNumber: r.chassisNumber })),
         score: {
           correct,
           total,
-          percentage: total > 0 ? Math.round((correct / total) * 100) : 0,
+          percentage: total > 0 ? Math.round((correct / total) * 100) : 0
         },
-        imageProcessing: { status: 'completed', stats: {} },
-        inviteStatus,
+        imageProcessing: {
+          status: 'completed',
+          stats: {}
+        },
+        inviteStatus: inviteStatus,
         timing: {
           timeSpent: submissionTimeSpent,
           timeSpentFormatted: formatTimeDuration(submissionTimeSpent),
           startedAt: actualStartedAt,
           completedAt: actualCompletedAt,
           hasSession: !!formSession,
-          sessionId: sessionId || formSession?.sessionId,
-        },
-      },
+          sessionId: sessionId || formSession?.sessionId
+        }
+      }
     });
+
   } catch (error) {
     console.error('Create response error:', error);
     res.status(500).json({
       success: false,
       message: error.message || 'Internal server error',
       error: error.message || String(error),
+      stack: error.stack
     });
   }
-};
+}
 
-// ═════════════════════════════════════════════════════════════════════════════
-// batchImportResponses
-// ═════════════════════════════════════════════════════════════════════════════
+
+function formatTimeDuration(seconds) {
+  if (!seconds || seconds < 0) return '0 seconds';
+  if (seconds < 60) return `${seconds} second${seconds !== 1 ? 's' : ''}`;
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  if (minutes < 60) {
+    if (remainingSeconds === 0) {
+      return `${minutes} minute${minutes !== 1 ? 's' : ''}`;
+    }
+    return `${minutes} minute${minutes !== 1 ? 's' : ''} ${remainingSeconds} second${remainingSeconds !== 1 ? 's' : ''}`;
+  }
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  if (remainingMinutes === 0) {
+    return `${hours} hour${hours !== 1 ? 's' : ''}`;
+  }
+  return `${hours} hour${hours !== 1 ? 's' : ''} ${remainingMinutes} minute${remainingMinutes !== 1 ? 's' : ''}`;
+}
+
+
 export const batchImportResponses = async (req, res) => {
+  // Declare batchId at the function scope
   let batchId;
+
   try {
     console.log('=== BATCH IMPORT ===');
+
     const { questionId, questionID, responses } = req.body;
     const actualQuestionId = questionId || questionID;
+
+    // Set batchId at function scope
     batchId = req.body.batchId || `batch-${Date.now()}`;
 
+    console.log('Batch ID:', batchId);
+    console.log('Searching for form ID:', actualQuestionId);
+    console.log('[BATCH IMPORT DEBUG] First response received:', JSON.stringify(responses[0]));
+
     if (!actualQuestionId || !Array.isArray(responses) || responses.length === 0) {
-      return res.status(400).json({ success: false, message: 'Invalid request' });
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid request'
+      });
     }
 
+    // Find form (without isVisible check for now)
     const searchConditions = [{ id: actualQuestionId }];
     if (mongoose.Types.ObjectId.isValid(actualQuestionId)) {
       searchConditions.push({ _id: new mongoose.Types.ObjectId(String(actualQuestionId)) }, { _id: actualQuestionId });
     }
     const form = await Form.findOne({ $or: searchConditions });
     if (!form) {
-      return res.status(404).json({ success: false, message: `Form with ID "${actualQuestionId}" not found` });
+      return res.status(404).json({
+        success: false,
+        message: `Form with ID "${actualQuestionId}" not found`
+      });
     }
 
+    // STEP 0: Prefetch metadata and form questions once
     const submissionMetadata = await collectSubmissionMetadata(req, {
       includeLocation: form.locationEnabled !== false,
     });
 
+    // Helper to safely extract chassis string from answers
     const extractChassisFromAns = (ans) => {
       if (!ans) return null;
       const plain = ans instanceof Map ? Object.fromEntries(ans) : ans;
@@ -1591,17 +1767,13 @@ export const batchImportResponses = async (req, res) => {
         plain['Chassis No'] ||
         plain['CHASSIS NUMBER']
       );
+
       if (!val && form) {
         const allFormQuestions = [];
-        (form.sections || []).forEach((s) => (s.questions || []).forEach((q) => allFormQuestions.push(q)));
-        (form.followUpQuestions || []).forEach((q) => allFormQuestions.push(q));
+        (form.sections || []).forEach(s => (s.questions || []).forEach(q => allFormQuestions.push(q)));
+        (form.followUpQuestions || []).forEach(q => allFormQuestions.push(q));
         for (const q of allFormQuestions) {
-          if (
-            q.trackResponseRank ||
-            q.type === 'range' ||
-            q.type === 'chassisNumber' ||
-            (q.text && (q.text.toLowerCase().includes('chassis') || q.text.toLowerCase().includes('identification')))
-          ) {
+          if (q.trackResponseRank || q.type === 'range' || q.type === 'chassisNumber' || (q.text && (q.text.toLowerCase().includes('chassis') || q.text.toLowerCase().includes('identification')))) {
             const raw = plain[q.id] || plain[q.text] || plain[`${q.id}_tracking`];
             const str = extractAnswerString(raw);
             if (str && str !== '-' && str !== 'N/A') {
@@ -1614,13 +1786,13 @@ export const batchImportResponses = async (req, res) => {
       return val ? String(val).trim() : null;
     };
 
-    const isFollowUpBatch =
-      Boolean(form.parentFormId) || String(batchId).includes('-t2') || String(batchId).includes('-fu-');
+    // Pre-fetch parent responses by chassis if this is a follow-up form or follow-up/template 2 import batch
+    const isFollowUpBatch = Boolean(form.parentFormId) || String(batchId).includes('-t2') || String(batchId).includes('-fu-');
     const chassisToParentMap = new Map();
 
     if (isFollowUpBatch) {
       const chassisListInBatch = responses
-        .map((r) => extractChassisFromAns(r.answers) || (r.chassisNumber ? String(r.chassisNumber).trim() : null))
+        .map(r => extractChassisFromAns(r.answers) || (r.chassisNumber ? String(r.chassisNumber).trim() : null))
         .filter(Boolean);
       const uniqueChassisInBatch = Array.from(new Set(chassisListInBatch));
 
@@ -1644,42 +1816,57 @@ export const batchImportResponses = async (req, res) => {
             { 'answers.ID number': { $in: uniqueChassisInBatch } },
             { 'answers.Chassis / VIN': { $in: uniqueChassisInBatch } },
             { 'answers.Chassis No': { $in: uniqueChassisInBatch } },
-            { 'answers.CHASSIS NUMBER': { $in: uniqueChassisInBatch } },
-          ],
+            { 'answers.CHASSIS NUMBER': { $in: uniqueChassisInBatch } }
+          ]
         };
-        if (!form.parentFormId) parentQuery.batchId = { $ne: batchId };
+        if (!form.parentFormId) {
+          parentQuery.batchId = { $ne: batchId };
+        }
 
         try {
           const matchedParents = await Response.find(parentQuery)
             .select('id _id chassisNumber answers createdAt status submittedBy')
             .sort({ createdAt: -1 })
             .lean();
-          matchedParents.forEach((p) => {
-            const pAns = p.answers instanceof Map ? Object.fromEntries(p.answers) : p.answers || {};
+
+          matchedParents.forEach(p => {
+            const pAns = p.answers instanceof Map ? Object.fromEntries(p.answers) : (p.answers || {});
             const pChassis = (p.chassisNumber || extractChassisFromAns(pAns) || '').toLowerCase().trim();
             if (pChassis && !chassisToParentMap.has(pChassis)) {
               chassisToParentMap.set(pChassis, p.id || (p._id ? p._id.toString() : null));
             }
           });
+          console.log(`[BATCH ${batchId}] Auto-matched ${chassisToParentMap.size} parent chassis records.`);
         } catch (matchErr) {
-          console.warn('[BATCH IMPORT] Error prefetching parent responses:', matchErr);
+          console.warn('[BATCH IMPORT] Error prefetching parent responses for chassis matching:', matchErr);
         }
       }
     }
 
     const collectAllQuestions = (questions, result = []) => {
       if (!Array.isArray(questions)) return result;
-      questions.forEach((q) => {
+      questions.forEach(q => {
         result.push(q);
-        if (Array.isArray(q.followUpQuestions)) collectAllQuestions(q.followUpQuestions, result);
+        if (Array.isArray(q.followUpQuestions)) {
+          collectAllQuestions(q.followUpQuestions, result);
+        }
       });
       return result;
     };
-    const allQuestions = [];
-    (form.sections || []).forEach((s) => collectAllQuestions(s.questions, allQuestions));
-    collectAllQuestions(form.followUpQuestions, allQuestions);
 
-    const rankTrackedQuestions = allQuestions.filter((q) => q.trackResponseRank || q.trackResponseQuestion);
+    const allQuestions = [];
+    if (form.sections) {
+      form.sections.forEach(section => {
+        if (section.questions) {
+          collectAllQuestions(section.questions, allQuestions);
+        }
+      });
+    }
+    if (form.followUpQuestions) {
+      collectAllQuestions(form.followUpQuestions, allQuestions);
+    }
+
+    const rankTrackedQuestions = allQuestions.filter(q => q.trackResponseRank || q.trackResponseQuestion);
     const rankMaps = {};
     for (const question of rankTrackedQuestions) {
       const qId = question.id;
@@ -1691,121 +1878,183 @@ export const batchImportResponses = async (req, res) => {
             isSectionSubmit: { $ne: true },
             $or: [
               { [`answers.${qId}`]: { $exists: true, $ne: null } },
-              { [`answers.${trackingQId}`]: { $exists: true, $ne: null } },
-            ],
-          },
+              { [`answers.${trackingQId}`]: { $exists: true, $ne: null } }
+            ]
+          }
         },
-        { $project: { answerVal: { $ifNull: [`$answers.${qId}`, `$answers.${trackingQId}`] } } },
-        { $group: { _id: '$answerVal', count: { $sum: 1 } } },
+        {
+          $project: {
+            answerVal: { $ifNull: [`$answers.${qId}`, `$answers.${trackingQId}`] }
+          }
+        },
+        {
+          $group: {
+            _id: "$answerVal",
+            count: { $sum: 1 }
+          }
+        }
       ]);
       const map = new Map();
-      counts.forEach((c) => {
+      counts.forEach(c => {
         const strVal = extractAnswerString(c._id);
-        if (strVal !== '') map.set(strVal.toLowerCase(), c.count);
+        if (strVal !== '') {
+          map.set(strVal.toLowerCase(), c.count);
+        }
       });
       rankMaps[qId] = map;
     }
 
+    // STEP 1: Collect ALL Google Drive URLs from ALL responses FIRST
+    console.log(`[BATCH ${batchId}] Collecting all Google Drive URLs from ${responses.length} responses`);
+
     const allGoogleDriveUrls = [];
     const urlToResponseMap = new Map();
+
     responses.forEach((response, responseIndex) => {
       const { answers } = response;
+
       if (!answers || typeof answers !== 'object') return;
-      Object.entries(answers).forEach(([answerKey, answer]) => {
+
+      Object.entries(answers).forEach(([questionId, answer]) => {
         if (!answer) return;
+
         if (typeof answer === 'string' && isGoogleDriveUrl(answer)) {
-          allGoogleDriveUrls.push({ url: answer, questionId: answerKey, responseIndex, type: 'single' });
-          urlToResponseMap.set(`${responseIndex}_${answerKey}`, answer);
+          const urlKey = `${responseIndex}_${questionId}`;
+          allGoogleDriveUrls.push({
+            url: answer,
+            questionId,
+            responseIndex,
+            type: 'single'
+          });
+          urlToResponseMap.set(urlKey, answer);
         } else if (Array.isArray(answer)) {
           answer.forEach((item, itemIndex) => {
             if (typeof item === 'string' && isGoogleDriveUrl(item)) {
+              const urlKey = `${responseIndex}_${questionId}_${itemIndex}`;
               allGoogleDriveUrls.push({
-                url: item, questionId: answerKey, responseIndex, arrayIndex: itemIndex, type: 'array',
+                url: item,
+                questionId,
+                responseIndex,
+                arrayIndex: itemIndex,
+                type: 'array'
               });
-              urlToResponseMap.set(`${responseIndex}_${answerKey}_${itemIndex}`, item);
+              urlToResponseMap.set(urlKey, item);
             }
           });
         }
       });
     });
 
+    console.log(`[BATCH ${batchId}] Found ${allGoogleDriveUrls.length} Google Drive URLs to process`);
+
+    // STEP 2: Process ALL images in BATCH using optimized service
     const createdResponses = [];
     const errors = [];
 
     if (allGoogleDriveUrls.length > 0) {
       try {
+        // Emit initial progress
         emitImageProgress(batchId, {
-          processed: 0, total: allGoogleDriveUrls.length,
-          status: 'processing', message: `Starting batch processing of ${allGoogleDriveUrls.length} images...`,
+          processed: 0,
+          total: allGoogleDriveUrls.length,
+          status: 'processing',
+          message: `Starting batch processing of ${allGoogleDriveUrls.length} images...`
         });
 
+        // Create a single answers object with ALL URLs for batch processing
         const batchAnswers = {};
         const urlMapping = {};
+
         allGoogleDriveUrls.forEach((item, index) => {
           const uniqueKey = `batch_${index}`;
           batchAnswers[uniqueKey] = item.url;
           urlMapping[uniqueKey] = item;
         });
 
+        // Process ALL images at once with optimized function
         const onProgressCallback = (progress) => {
           emitImageProgress(batchId, {
-            processed: progress.currentImage, total: progress.totalImages,
+            processed: progress.currentImage,
+            total: progress.totalImages,
             status: progress.status,
-            message: progress.message || 'Processing images...',
-            percentage: progress.percentage,
+            message: progress.message || `Processing images...`,
+            percentage: progress.percentage
           });
         };
 
+        // Prepare metadata for Google Drive folder structure
         const metadata = {
-          tenantId: form.tenantId, formId: actualQuestionId,
-          submissionId: `batch-${batchId}`, submissionTimestamp: Date.now(),
+          tenantId: form.tenantId,
+          formId: actualQuestionId,
+          submissionId: `batch-${batchId}`,
+          submissionTimestamp: Date.now()
         };
 
-        const processedBatch = await processResponseImages(batchAnswers, metadata, onProgressCallback, batchId);
+        const processedBatch = await processResponseImages(
+          batchAnswers,
+          metadata,  // CORRECT: This should be metadata object
+          onProgressCallback,
+          batchId
+        );
 
+        // Create mapping of original URL -> Cloudinary URL
         const processedUrlMap = new Map();
         const driveBackupMap = new Map();
         Object.entries(processedBatch.processedAnswers).forEach(([uniqueKey, cloudinaryUrl]) => {
           const item = urlMapping[uniqueKey];
           if (item && cloudinaryUrl !== item.url) {
             processedUrlMap.set(item.url, cloudinaryUrl);
+
+            // Store drive backup info
             if (processedBatch.driveBackupUrls && processedBatch.driveBackupUrls[uniqueKey]) {
               driveBackupMap.set(item.url, processedBatch.driveBackupUrls[uniqueKey]);
             }
           }
         });
+        console.log(`[BATCH ${batchId}] Successfully processed ${processedUrlMap.size}/${allGoogleDriveUrls.length} URLs`);
 
+        // STEP 3: Process each response with already converted URLs
         const responsesToSave = [];
         for (let index = 0; index < responses.length; index++) {
           try {
-            const { answers, submittedBy, submitterContact, parentResponseId } = responses[index];
+            const { answers, submittedBy, submitterContact, parentResponseId, submittedAt } = responses[index];
+
+            // Replace Google Drive URLs with Cloudinary URLs in this response
             const processedAnswers = {};
-            Object.entries(answers || {}).forEach(([answerKey, answer]) => {
+            Object.entries(answers).forEach(([questionId, answer]) => {
               if (!answer) {
-                processedAnswers[answerKey] = answer;
+                processedAnswers[questionId] = answer;
                 return;
               }
+
               if (typeof answer === 'string' && isGoogleDriveUrl(answer)) {
-                processedAnswers[answerKey] = processedUrlMap.get(answer) || answer;
+                // Replace with processed URL if available
+                processedAnswers[questionId] = processedUrlMap.get(answer) || answer;
               } else if (Array.isArray(answer)) {
-                processedAnswers[answerKey] = answer.map((item) =>
-                  typeof item === 'string' && isGoogleDriveUrl(item) ? processedUrlMap.get(item) || item : item
+                // Process array answers
+                processedAnswers[questionId] = answer.map(item =>
+                  (typeof item === 'string' && isGoogleDriveUrl(item))
+                    ? (processedUrlMap.get(item) || item)
+                    : item
                 );
               } else {
-                processedAnswers[answerKey] = answer;
+                processedAnswers[questionId] = answer;
               }
             });
 
             let correct = 0;
             let total = 0;
-            allQuestions.forEach((question) => {
+
+            allQuestions.forEach(question => {
               if (question.type === 'yesNoNA') {
                 total++;
                 const answer = processedAnswers[question.id];
-                if (answer && String(answer).toLowerCase() === 'yes') correct++;
+                if (answer && String(answer).toLowerCase() === 'yes') {
+                  correct++;
+                }
               }
             });
-
+            // Calculate ranks for specific questions
             const responseRanks = {};
             for (const question of rankTrackedQuestions) {
               const qId = question.id;
@@ -1822,29 +2071,29 @@ export const batchImportResponses = async (req, res) => {
               }
             }
 
-            let chassisVal =
-              extractChassisFromAns(processedAnswers) ||
-              (responses[index]?.chassisNumber ? String(responses[index].chassisNumber).trim() : undefined);
+            let chassisVal = extractChassisFromAns(processedAnswers) || (responses[index]?.chassisNumber ? String(responses[index].chassisNumber).trim() : undefined);
             const batchConfiguredChassis = (form.chassisNumbers || [])
-              .map((c) => (typeof c === 'string' ? c : c.chassisNumber || c.name))
+              .map(c => typeof c === 'string' ? c : (c.chassisNumber || c.name))
               .filter(Boolean);
+
             if (batchConfiguredChassis.length > 0) {
               if (chassisVal && !batchConfiguredChassis.includes(chassisVal)) {
+                // If chassisVal doesn't match configured options, check answers
                 const matchingAns = Object.values(processedAnswers).find(
-                  (v) => typeof v === 'string' && batchConfiguredChassis.includes(v.trim())
+                  v => typeof v === 'string' && batchConfiguredChassis.includes(v.trim())
                 );
-                if (matchingAns) chassisVal = typeof matchingAns === 'string' ? matchingAns.trim() : matchingAns;
-                else if (batchConfiguredChassis.length === 1) chassisVal = batchConfiguredChassis[0];
+                if (matchingAns) {
+                  chassisVal = typeof matchingAns === 'string' ? matchingAns.trim() : matchingAns;
+                } else if (batchConfiguredChassis.length === 1) {
+                  chassisVal = batchConfiguredChassis[0];
+                }
               } else if (!chassisVal && batchConfiguredChassis.length === 1) {
                 chassisVal = batchConfiguredChassis[0];
               }
             } else if (!chassisVal) {
+              // Form has no configured chassis, check chassis questions
               for (const q of allQuestions) {
-                if (
-                  q.trackResponseRank ||
-                  q.type === 'chassisNumber' ||
-                  (q.text && q.text.toLowerCase().includes('chassis') && !q.text.toLowerCase().includes('zone'))
-                ) {
+                if (q.trackResponseRank || q.type === 'chassisNumber' || (q.text && q.text.toLowerCase().includes('chassis') && !q.text.toLowerCase().includes('zone'))) {
                   const qVal = extractAnswerString(processedAnswers[q.id] || processedAnswers[`${q.id}_tracking`]);
                   if (qVal) {
                     chassisVal = qVal;
@@ -1853,7 +2102,10 @@ export const batchImportResponses = async (req, res) => {
                 }
               }
             }
-            if (chassisVal && !processedAnswers.chassis_number) processedAnswers.chassis_number = chassisVal;
+
+            if (chassisVal && !processedAnswers.chassis_number) {
+              processedAnswers.chassis_number = chassisVal;
+            }
 
             let resolvedParentResponseId = parentResponseId;
             if (!resolvedParentResponseId && chassisVal) {
@@ -1864,54 +2116,46 @@ export const batchImportResponses = async (req, res) => {
               responses[index]?.submittedAt ||
               responses[index]?.createdAt ||
               responses[index]?.timestamp ||
-              processedAnswers['submittedAt'] ||
-              processedAnswers['Submitted Date *'] ||
-              processedAnswers['Submitted Date'] ||
-              processedAnswers['submitted date'] ||
-              processedAnswers['submittedDate'] ||
-              processedAnswers['Timestamp'] ||
-              processedAnswers['timestamp'] ||
-              processedAnswers['Date'] ||
-              processedAnswers['date'] ||
-              processedAnswers['Inspection Date'] ||
-              processedAnswers['Created At'] ||
-              processedAnswers['createdAt'];
+              processedAnswers["submittedAt"] ||
+              processedAnswers["Submitted Date *"] ||
+              processedAnswers["Submitted Date"] ||
+              processedAnswers["submitted date"] ||
+              processedAnswers["submittedDate"] ||
+              processedAnswers["Timestamp"] ||
+              processedAnswers["timestamp"] ||
+              processedAnswers["Date"] ||
+              processedAnswers["date"] ||
+              processedAnswers["Inspection Date"] ||
+              processedAnswers["Created At"] ||
+              processedAnswers["createdAt"];
+
             const rowSubmittedAt = parseExcelDateBackend(rawDateVal) || new Date();
 
-            const isDispVal = String(
-              responses[index]?.isDispatched || processedAnswers['Dispatched'] || processedAnswers['dispatched'] || ''
-            )
-              .toLowerCase()
-              .trim();
-            const isDispatched = isDispVal === 'yes' || isDispVal === 'true' || responses[index]?.isDispatched === true;
-            const rawDispAt =
-              responses[index]?.dispatchedAt ||
-              processedAnswers['Dispatched At'] ||
-              processedAnswers['dispatchedAt'] ||
-              processedAnswers['dispatched at'];
-            const rowDispatchedAt = isDispatched ? parseExcelDateBackend(rawDispAt) || rowSubmittedAt : undefined;
+            const isDispVal = String(responses[index]?.isDispatched || processedAnswers["Dispatched"] || processedAnswers["dispatched"] || "").toLowerCase().trim();
+            const isDispatched = isDispVal === "yes" || isDispVal === "true" || responses[index]?.isDispatched === true;
+            const rawDispAt = responses[index]?.dispatchedAt || processedAnswers["Dispatched At"] || processedAnswers["dispatchedAt"] || processedAnswers["dispatched at"];
+            const rowDispatchedAt = isDispatched ? (parseExcelDateBackend(rawDispAt) || rowSubmittedAt) : undefined;
 
-            const rawStatusVal =
-              responses[index]?.status || processedAnswers['Status'] || processedAnswers['status'];
+            const rawStatusVal = responses[index]?.status || processedAnswers["Status"] || processedAnswers["status"];
             const rowStatus = rawStatusVal ? String(rawStatusVal).trim() : 'pending';
 
-            const formQuestionIds = new Set(
-              allQuestions.map((q) => q.id || (q._id ? q._id.toString() : null)).filter(Boolean)
-            );
-            [
-              'Timestamp', 'timestamp', 'Date', 'date', 'Status', 'status', 'Dispatched', 'dispatched',
-              'Dispatched At', 'dispatched at', 'submittedAt', 'isDispatched', 'dispatchedAt',
-              'Submitted Date', 'Submitted Date *', 'submitted date', 'submittedDate',
-            ].forEach((k) => {
-              if (!formQuestionIds.has(k)) delete processedAnswers[k];
+            // Clean up virtual columns so they don't pollute question answers
+            const formQuestionIds = new Set(allQuestions.map(q => q.id || (q._id ? q._id.toString() : null)).filter(Boolean));
+            ["Timestamp", "timestamp", "Date", "date", "Status", "status", "Dispatched", "dispatched", "Dispatched At", "dispatched at", "submittedAt", "isDispatched", "dispatchedAt", "Submitted Date", "Submitted Date *", "submitted date", "submittedDate"].forEach(k => {
+              if (!formQuestionIds.has(k)) {
+                delete processedAnswers[k];
+              }
             });
 
             const rowSubmissionMetadata = {
               ...(submissionMetadata || {}),
               submittedAt: rowSubmittedAt,
               capturedLocation: submissionMetadata?.capturedLocation
-                ? { ...submissionMetadata.capturedLocation, capturedAt: rowSubmittedAt }
-                : undefined,
+                ? {
+                  ...submissionMetadata.capturedLocation,
+                  capturedAt: rowSubmittedAt
+                }
+                : undefined
             };
 
             const responseData = {
@@ -1920,13 +2164,13 @@ export const batchImportResponses = async (req, res) => {
               answers: new Map(Object.entries(processedAnswers)),
               responseRanks: new Map(Object.entries(responseRanks)),
               parentResponseId: resolvedParentResponseId || undefined,
-              batchId,
+              batchId: batchId,
               chassisNumber: chassisVal || undefined,
               submittedBy: submittedBy || 'Excel Import',
               submitterContact,
               submissionMetadata: rowSubmissionMetadata,
               status: rowStatus,
-              isDispatched,
+              isDispatched: isDispatched,
               dispatchedAt: rowDispatchedAt,
               tenantId: form.tenantId,
               score: { correct, total },
@@ -1937,14 +2181,14 @@ export const batchImportResponses = async (req, res) => {
                     ? req.user._id
                     : null,
               submittedAt: rowSubmittedAt,
-              createdAt: rowSubmittedAt,
+              createdAt: rowSubmittedAt
             };
 
-            const rowRange =
-              extractRangeBounds(chassisVal) ||
+            const rowRange = extractRangeBounds(chassisVal) ||
               extractRangeBounds(processedAnswers['Identification Number']) ||
               extractRangeBounds(processedAnswers['ID number']) ||
               extractRangeBounds(processedAnswers.chassis_number);
+
             let rowUnits = [];
             if (rowRange && rowRange.start && rowRange.end) {
               rowUnits = expandChassisRange(rowRange.start, rowRange.end);
@@ -1955,10 +2199,7 @@ export const batchImportResponses = async (req, res) => {
               for (let uIdx = 0; uIdx < rowUnits.length; uIdx++) {
                 const uChassis = rowUnits[uIdx];
                 const uAnswers = { ...processedAnswers };
-                const uFinalChassis =
-                  batchConfiguredChassis.length > 0 && batchConfiguredChassis.includes(chassisVal)
-                    ? chassisVal
-                    : uChassis;
+                const uFinalChassis = (batchConfiguredChassis.length > 0 && batchConfiguredChassis.includes(chassisVal)) ? chassisVal : uChassis;
                 uAnswers.chassis_number = uFinalChassis;
                 if (uAnswers['Identification Number'] !== undefined) uAnswers['Identification Number'] = uChassis;
                 if (uAnswers['identification_number'] !== undefined) uAnswers['identification_number'] = uChassis;
@@ -1966,12 +2207,7 @@ export const batchImportResponses = async (req, res) => {
                 if (uAnswers['ID number'] !== undefined) uAnswers['ID number'] = uChassis;
                 if (uAnswers.id_number !== undefined) uAnswers.id_number = uChassis;
                 for (const q of allQuestions) {
-                  if (
-                    q.trackResponseRank ||
-                    q.type === 'range' ||
-                    (q.text &&
-                      (q.text.toLowerCase().includes('chassis') || q.text.toLowerCase().includes('identification')))
-                  ) {
+                  if (q.trackResponseRank || q.type === 'range' || (q.text && (q.text.toLowerCase().includes('chassis') || q.text.toLowerCase().includes('identification')))) {
                     if (uAnswers[q.id] !== undefined) uAnswers[q.id] = uChassis;
                   }
                 }
@@ -1980,86 +2216,124 @@ export const batchImportResponses = async (req, res) => {
                   uParentId = chassisToParentMap.get(uChassis.toLowerCase().trim()) || undefined;
                 }
                 const uDate = new Date(baseTime + (rowUnits.length - uIdx) * 1000);
-                responsesToSave.push(
-                  new Response({
-                    ...responseData,
-                    id: uuidv4(),
-                    answers: new Map(Object.entries(uAnswers)),
-                    parentResponseId: uParentId || undefined,
-                    chassisNumber: uFinalChassis,
-                    submittedAt: uDate,
-                    createdAt: uDate,
-                  })
-                );
+                const uResponseData = {
+                  ...responseData,
+                  id: uuidv4(),
+                  answers: new Map(Object.entries(uAnswers)),
+                  parentResponseId: uParentId || undefined,
+                  chassisNumber: uFinalChassis,
+                  submittedAt: uDate,
+                  createdAt: uDate
+                };
+                responsesToSave.push(new Response(uResponseData));
               }
             } else {
-              responsesToSave.push(new Response(responseData));
+              const response = new Response(responseData);
+              responsesToSave.push(response);
             }
           } catch (error) {
             console.error(`[BATCH ${batchId}] Response prep error (index ${index}):`, error.message);
-            errors.push({ index, submittedBy: responses[index]?.submittedBy || 'Unknown', error: error.message });
+            errors.push({
+              index,
+              submittedBy: responses[index]?.submittedBy || 'Unknown',
+              error: error.message
+            });
           }
         }
 
+        // Save responses in fast bulk chunks (250 at a time)
         const batchSize = 250;
         for (let i = 0; i < responsesToSave.length; i += batchSize) {
           const chunk = responsesToSave.slice(i, i + batchSize);
           try {
             const inserted = await Response.insertMany(chunk, { ordered: false });
-            inserted.forEach((doc) =>
+            inserted.forEach((doc) => {
               createdResponses.push({
-                id: doc.id, submittedBy: doc.submittedBy, chassisNumber: doc.chassisNumber,
-                parentResponseId: doc.parentResponseId, status: 'success',
-              })
-            );
+                id: doc.id,
+                submittedBy: doc.submittedBy,
+                chassisNumber: doc.chassisNumber,
+                parentResponseId: doc.parentResponseId,
+                status: 'success'
+              });
+            });
           } catch (error) {
             if (error.insertedDocs && error.insertedDocs.length > 0) {
-              error.insertedDocs.forEach((doc) =>
+              error.insertedDocs.forEach((doc) => {
                 createdResponses.push({
-                  id: doc.id, submittedBy: doc.submittedBy, chassisNumber: doc.chassisNumber,
-                  parentResponseId: doc.parentResponseId, status: 'success',
-                })
-              );
+                  id: doc.id,
+                  submittedBy: doc.submittedBy,
+                  chassisNumber: doc.chassisNumber,
+                  parentResponseId: doc.parentResponseId,
+                  status: 'success'
+                });
+              });
             }
             if (error.writeErrors && error.writeErrors.length > 0) {
-              error.writeErrors.forEach((we) =>
-                errors.push({ submittedBy: 'Import row', error: we.errmsg || we.message })
-              );
+              error.writeErrors.forEach((we) => {
+                errors.push({
+                  submittedBy: 'Import row',
+                  error: we.errmsg || we.message
+                });
+              });
             } else {
-              await Promise.all(
-                chunk.map(async (response) => {
-                  try {
-                    if (response.submittedAt) await response.save({ timestamps: false });
-                    else await response.save();
-                    createdResponses.push({
-                      id: response.id, submittedBy: response.submittedBy,
-                      chassisNumber: response.chassisNumber,
-                      parentResponseId: response.parentResponseId, status: 'success',
-                    });
-                  } catch (singleErr) {
-                    errors.push({ submittedBy: response.submittedBy, error: singleErr.message });
+              console.error(`[BATCH ${batchId}] Bulk save error, attempting individual fallback:`, error.message);
+              await Promise.all(chunk.map(async (response) => {
+                try {
+                  if (response.submittedAt) {
+                    await response.save({ timestamps: false });
+                  } else {
+                    await response.save();
                   }
-                })
-              );
+                  createdResponses.push({
+                    id: response.id,
+                    submittedBy: response.submittedBy,
+                    chassisNumber: response.chassisNumber,
+                    parentResponseId: response.parentResponseId,
+                    status: 'success'
+                  });
+                } catch (singleErr) {
+                  errors.push({
+                    submittedBy: response.submittedBy,
+                    error: singleErr.message
+                  });
+                }
+              }));
             }
           }
         }
 
+        // Notify form rooms and dashboards immediately
         if (typeof emitBatchImported === 'function') {
-          const batchInfo = { batchId, count: createdResponses.length, total: responses.length, formId: actualQuestionId };
+          const batchInfo = {
+            batchId,
+            count: createdResponses.length,
+            total: responses.length,
+            formId: actualQuestionId,
+          };
           emitBatchImported(actualQuestionId, batchInfo);
-          if (form?.id && String(form.id) !== String(actualQuestionId)) emitBatchImported(form.id, batchInfo);
-          if (form?._id && String(form._id) !== String(actualQuestionId)) emitBatchImported(String(form._id), batchInfo);
+          if (form?.id && String(form.id) !== String(actualQuestionId)) {
+            emitBatchImported(form.id, batchInfo);
+          }
+          if (form?._id && String(form._id) !== String(actualQuestionId)) {
+            emitBatchImported(String(form._id), batchInfo);
+          }
         }
 
+        // Emit completion progress
         emitImageProgress(batchId, {
-          processed: allGoogleDriveUrls.length, total: allGoogleDriveUrls.length,
+          processed: allGoogleDriveUrls.length,
+          total: allGoogleDriveUrls.length,
           status: 'complete',
-          message: `✓ Batch processing complete: ${createdResponses.length}/${responses.length} responses saved`,
+          message: `✓ Batch processing complete: ${createdResponses.length}/${responses.length} responses saved`
         });
+
       } catch (error) {
         console.error(`[BATCH ${batchId}] Batch processing error:`, error);
-        errors.push({ index: 'batch', submittedBy: 'batch', error: error.message });
+        errors.push({
+          index: 'batch',
+          submittedBy: 'batch',
+          error: error.message
+        });
       }
 
       const extractedChassis = [];
@@ -2067,13 +2341,13 @@ export const batchImportResponses = async (req, res) => {
         if (resp?.answers) {
           for (const [k, v] of Object.entries(resp.answers)) {
             if (
-              typeof v === 'string' && v.trim() &&
-              (k.toLowerCase().includes('chassis') ||
-                k.toLowerCase().includes('vin') ||
-                k.toLowerCase().includes('id number') ||
-                k === 'chassis_number')
+              typeof v === 'string' &&
+              v.trim() &&
+              (k.toLowerCase().includes('chassis') || k.toLowerCase().includes('vin') || k.toLowerCase().includes('id number') || k === 'chassis_number')
             ) {
-              if (!extractedChassis.includes(v.trim())) extractedChassis.push(v.trim());
+              if (!extractedChassis.includes(v.trim())) {
+                extractedChassis.push(v.trim());
+              }
               if (extractedChassis.length >= 25) break;
             }
           }
@@ -2094,20 +2368,23 @@ export const batchImportResponses = async (req, res) => {
         batchId,
         fileName: req.body.fileName || 'Response_Template.xlsx',
         templateType: batchId.includes('-t2') ? 'Template 2' : batchId.includes('-fu-') ? 'Follow-up Form' : 'Main Form',
-        dataCount: { total: responses.length, success: createdResponses.length, failed: errors.length },
+        dataCount: {
+          total: responses.length,
+          success: createdResponses.length,
+          failed: errors.length
+        },
         details: {
           chassisNumbers: extractedChassis,
-          submitters: Array.from(new Set(responses.map((r) => r.submittedBy).filter(Boolean))),
+          submitters: Array.from(new Set(responses.map(r => r.submittedBy).filter(Boolean))),
           questionsCount: Object.keys(responses[0]?.answers || {}).length,
           errors: errors.slice(0, 10),
-          notes: `Imported ${createdResponses.length} of ${responses.length} responses (with images)`,
+          notes: `Imported ${createdResponses.length} of ${responses.length} responses (with images)`
         },
-        status: errors.length === 0 ? 'success' : createdResponses.length > 0 ? 'partial' : 'failed',
-      }).catch((err) => console.error('[IMPORT HISTORY LOG ERROR]', err));
+        status: errors.length === 0 ? 'success' : createdResponses.length > 0 ? 'partial' : 'failed'
+      }).catch(err => console.error('[IMPORT HISTORY LOG ERROR]', err));
 
-      clearRankCache(actualQuestionId);
-      clearRankCache(form?.id);
-
+      // SEND RESPONSE FOR IMAGES PATH
+      console.log(`[BATCH ${batchId}] Sending success response (with images)`);
       return res.status(201).json({
         success: true,
         message: `Batch import completed: ${createdResponses.length} responses imported successfully`,
@@ -2117,35 +2394,49 @@ export const batchImportResponses = async (req, res) => {
           failed: errors.length,
           createdResponses,
           imageConversion: {
-            total: allGoogleDriveUrls.length, converted: allGoogleDriveUrls.length,
-            status: allGoogleDriveUrls.length > 0 ? 'completed' : 'not_required', batchId,
+            total: allGoogleDriveUrls.length,
+            converted: allGoogleDriveUrls.length,
+            status: allGoogleDriveUrls.length > 0 ? "completed" : "not_required",
+            batchId
           },
-          errors: errors.length > 0 ? errors : undefined,
-        },
+          errors: errors.length > 0 ? errors : undefined
+        }
       });
+
     } else {
-      // No images
+      // No images to process, just save responses directly
+      console.log(`[BATCH ${batchId}] No images to process, saving ${responses.length} responses directly`);
+
+      const createdResponses = [];
+      const errors = [];
       const responsesToSave = [];
+
       for (let index = 0; index < responses.length; index++) {
         try {
-          const { answers, submittedBy, submitterContact, parentResponseId } = responses[index];
+          const { answers, submittedBy, submitterContact, parentResponseId, submittedAt } = responses[index];
+
+          // Process answers (convert to proper format)
           const processedAnswers = {};
           if (answers && typeof answers === 'object') {
-            Object.entries(answers).forEach(([k, v]) => {
-              processedAnswers[k] = v;
+            Object.entries(answers).forEach(([questionId, answer]) => {
+              processedAnswers[questionId] = answer;
             });
           }
 
+          // Calculate score for yesNoNA questions
           let correct = 0;
           let total = 0;
-          allQuestions.forEach((question) => {
+          allQuestions.forEach(question => {
             if (question.type === 'yesNoNA') {
               total++;
               const answer = processedAnswers[question.id];
-              if (answer && String(answer).toLowerCase() === 'yes') correct++;
+              if (answer && String(answer).toLowerCase() === 'yes') {
+                correct++;
+              }
             }
           });
 
+          // Calculate ranks for specific questions
           const responseRanks = {};
           for (const question of rankTrackedQuestions) {
             const qId = question.id;
@@ -2162,9 +2453,7 @@ export const batchImportResponses = async (req, res) => {
             }
           }
 
-          const chassisVal =
-            extractChassisFromAns(processedAnswers) ||
-            (responses[index]?.chassisNumber ? String(responses[index].chassisNumber).trim() : undefined);
+          const chassisVal = extractChassisFromAns(processedAnswers) || (responses[index]?.chassisNumber ? String(responses[index].chassisNumber).trim() : undefined);
           let resolvedParentResponseId = parentResponseId;
           if (!resolvedParentResponseId && chassisVal) {
             resolvedParentResponseId = chassisToParentMap.get(chassisVal.toLowerCase().trim()) || undefined;
@@ -2174,86 +2463,82 @@ export const batchImportResponses = async (req, res) => {
             responses[index]?.submittedAt ||
             responses[index]?.createdAt ||
             responses[index]?.timestamp ||
-            processedAnswers['submittedAt'] ||
-            processedAnswers['Submitted Date *'] ||
-            processedAnswers['Submitted Date'] ||
-            processedAnswers['submitted date'] ||
-            processedAnswers['submittedDate'] ||
-            processedAnswers['Timestamp'] ||
-            processedAnswers['timestamp'] ||
-            processedAnswers['Date'] ||
-            processedAnswers['date'] ||
-            processedAnswers['Inspection Date'] ||
-            processedAnswers['Created At'] ||
-            processedAnswers['createdAt'];
+            processedAnswers["submittedAt"] ||
+            processedAnswers["Submitted Date *"] ||
+            processedAnswers["Submitted Date"] ||
+            processedAnswers["submitted date"] ||
+            processedAnswers["submittedDate"] ||
+            processedAnswers["Timestamp"] ||
+            processedAnswers["timestamp"] ||
+            processedAnswers["Date"] ||
+            processedAnswers["date"] ||
+            processedAnswers["Inspection Date"] ||
+            processedAnswers["Created At"] ||
+            processedAnswers["createdAt"];
+
           const rowSubmittedAt = parseExcelDateBackend(rawDateVal) || new Date();
 
-          const isDispVal = String(
-            responses[index]?.isDispatched || processedAnswers['Dispatched'] || processedAnswers['dispatched'] || ''
-          )
-            .toLowerCase()
-            .trim();
-          const isDispatched = isDispVal === 'yes' || isDispVal === 'true' || responses[index]?.isDispatched === true;
-          const rawDispAt =
-            responses[index]?.dispatchedAt ||
-            processedAnswers['Dispatched At'] ||
-            processedAnswers['dispatchedAt'] ||
-            processedAnswers['dispatched at'];
-          const rowDispatchedAt = isDispatched ? parseExcelDateBackend(rawDispAt) || rowSubmittedAt : undefined;
+          const isDispVal = String(responses[index]?.isDispatched || processedAnswers["Dispatched"] || processedAnswers["dispatched"] || "").toLowerCase().trim();
+          const isDispatched = isDispVal === "yes" || isDispVal === "true" || responses[index]?.isDispatched === true;
+          const rawDispAt = responses[index]?.dispatchedAt || processedAnswers["Dispatched At"] || processedAnswers["dispatchedAt"] || processedAnswers["dispatched at"];
+          const rowDispatchedAt = isDispatched ? (parseExcelDateBackend(rawDispAt) || rowSubmittedAt) : undefined;
 
-          const rawStatusVal = responses[index]?.status || processedAnswers['Status'] || processedAnswers['status'];
+          const rawStatusVal = responses[index]?.status || processedAnswers["Status"] || processedAnswers["status"];
           const rowStatus = rawStatusVal ? String(rawStatusVal).trim() : 'pending';
 
-          const formQuestionIds = new Set(
-            allQuestions.map((q) => q.id || (q._id ? q._id.toString() : null)).filter(Boolean)
-          );
-          [
-            'Timestamp', 'timestamp', 'Date', 'date', 'Status', 'status', 'Dispatched', 'dispatched',
-            'Dispatched At', 'dispatched at', 'submittedAt', 'isDispatched', 'dispatchedAt',
-            'Submitted Date', 'Submitted Date *', 'submitted date', 'submittedDate',
-          ].forEach((k) => {
-            if (!formQuestionIds.has(k)) delete processedAnswers[k];
+          // Clean up virtual columns so they don't pollute question answers
+          const formQuestionIds = new Set(allQuestions.map(q => q.id || (q._id ? q._id.toString() : null)).filter(Boolean));
+          ["Timestamp", "timestamp", "Date", "date", "Status", "status", "Dispatched", "dispatched", "Dispatched At", "dispatched at", "submittedAt", "isDispatched", "dispatchedAt", "Submitted Date", "Submitted Date *", "submitted date", "submittedDate"].forEach(k => {
+            if (!formQuestionIds.has(k)) {
+              delete processedAnswers[k];
+            }
           });
 
           const rowSubmissionMetadata = {
             ...(submissionMetadata || {}),
             submittedAt: rowSubmittedAt,
             capturedLocation: submissionMetadata?.capturedLocation
-              ? { ...submissionMetadata.capturedLocation, capturedAt: rowSubmittedAt }
-              : undefined,
+              ? {
+                ...submissionMetadata.capturedLocation,
+                capturedAt: rowSubmittedAt
+              }
+              : undefined
           };
 
+          // Create response data
           const responseData = {
             id: uuidv4(),
             questionId: actualQuestionId,
             answers: new Map(Object.entries(processedAnswers)),
             responseRanks: new Map(Object.entries(responseRanks)),
             parentResponseId: resolvedParentResponseId || undefined,
-            batchId,
+            batchId: batchId,
             chassisNumber: chassisVal || undefined,
             submittedBy: submittedBy || 'Excel Import',
             submitterContact,
             submissionMetadata: rowSubmissionMetadata,
             status: rowStatus,
-            isDispatched,
+            isDispatched: isDispatched,
             dispatchedAt: rowDispatchedAt,
             tenantId: form.tenantId,
             score: { correct, total },
             createdBy:
-              req.user?._id && mongoose.Types.ObjectId.isValid(req.user._id) ? req.user._id : null,
+              req.user?._id && mongoose.Types.ObjectId.isValid(req.user._id)
+                ? req.user._id
+                : null,
             submittedAt: rowSubmittedAt,
-            createdAt: rowSubmittedAt,
+            createdAt: rowSubmittedAt
           };
 
           const noImgConfiguredChassis = (form.chassisNumbers || [])
-            .map((c) => (typeof c === 'string' ? c : c.chassisNumber || c.name))
+            .map(c => typeof c === 'string' ? c : (c.chassisNumber || c.name))
             .filter(Boolean);
 
-          const rowRange =
-            extractRangeBounds(chassisVal) ||
+          const rowRange = extractRangeBounds(chassisVal) ||
             extractRangeBounds(processedAnswers['Identification Number']) ||
             extractRangeBounds(processedAnswers['ID number']) ||
             extractRangeBounds(processedAnswers.chassis_number);
+
           let rowUnits = [];
           if (rowRange && rowRange.start && rowRange.end) {
             rowUnits = expandChassisRange(rowRange.start, rowRange.end);
@@ -2264,10 +2549,7 @@ export const batchImportResponses = async (req, res) => {
             for (let uIdx = 0; uIdx < rowUnits.length; uIdx++) {
               const uChassis = rowUnits[uIdx];
               const uAnswers = { ...processedAnswers };
-              const uFinalChassis =
-                noImgConfiguredChassis.length > 0 && noImgConfiguredChassis.includes(chassisVal)
-                  ? chassisVal
-                  : uChassis;
+              const uFinalChassis = (noImgConfiguredChassis.length > 0 && noImgConfiguredChassis.includes(chassisVal)) ? chassisVal : uChassis;
               uAnswers.chassis_number = uFinalChassis;
               if (uAnswers['Identification Number'] !== undefined) uAnswers['Identification Number'] = uChassis;
               if (uAnswers['identification_number'] !== undefined) uAnswers['identification_number'] = uChassis;
@@ -2275,12 +2557,7 @@ export const batchImportResponses = async (req, res) => {
               if (uAnswers['ID number'] !== undefined) uAnswers['ID number'] = uChassis;
               if (uAnswers.id_number !== undefined) uAnswers.id_number = uChassis;
               for (const q of allQuestions) {
-                if (
-                  q.trackResponseRank ||
-                  q.type === 'range' ||
-                  (q.text &&
-                    (q.text.toLowerCase().includes('chassis') || q.text.toLowerCase().includes('identification')))
-                ) {
+                if (q.trackResponseRank || q.type === 'range' || (q.text && (q.text.toLowerCase().includes('chassis') || q.text.toLowerCase().includes('identification')))) {
                   if (uAnswers[q.id] !== undefined) uAnswers[q.id] = uChassis;
                 }
               }
@@ -2289,90 +2566,123 @@ export const batchImportResponses = async (req, res) => {
                 uParentId = chassisToParentMap.get(uChassis.toLowerCase().trim()) || undefined;
               }
               const uDate = new Date(baseTime + (rowUnits.length - uIdx) * 1000);
-              responsesToSave.push(
-                new Response({
-                  ...responseData,
-                  id: uuidv4(),
-                  answers: new Map(Object.entries(uAnswers)),
-                  parentResponseId: uParentId || undefined,
-                  chassisNumber: uFinalChassis,
-                  submittedAt: uDate,
-                  createdAt: uDate,
-                })
-              );
+              const uResponseData = {
+                ...responseData,
+                id: uuidv4(),
+                answers: new Map(Object.entries(uAnswers)),
+                parentResponseId: uParentId || undefined,
+                chassisNumber: uFinalChassis,
+                submittedAt: uDate,
+                createdAt: uDate
+              };
+              responsesToSave.push(new Response(uResponseData));
             }
           } else {
-            responsesToSave.push(new Response(responseData));
+            // Prepare Mongoose document
+            const response = new Response(responseData);
+            responsesToSave.push(response);
           }
         } catch (error) {
           console.error(`[BATCH ${batchId}] Response prep error (no images, index ${index}):`, error.message);
-          errors.push({ index, submittedBy: responses[index]?.submittedBy || 'Unknown', error: error.message });
+          errors.push({
+            index,
+            submittedBy: responses[index]?.submittedBy || 'Unknown',
+            error: error.message
+          });
         }
       }
 
+      // Save in fast bulk chunks (250 at a time)
       const batchSize = 250;
       for (let i = 0; i < responsesToSave.length; i += batchSize) {
         const chunk = responsesToSave.slice(i, i + batchSize);
         try {
           const inserted = await Response.insertMany(chunk, { ordered: false });
-          inserted.forEach((doc) =>
+          inserted.forEach((doc) => {
             createdResponses.push({
-              id: doc.id, submittedBy: doc.submittedBy, chassisNumber: doc.chassisNumber,
-              parentResponseId: doc.parentResponseId, status: 'success',
-            })
-          );
+              id: doc.id,
+              submittedBy: doc.submittedBy,
+              chassisNumber: doc.chassisNumber,
+              parentResponseId: doc.parentResponseId,
+              status: 'success'
+            });
+          });
         } catch (error) {
           if (error.insertedDocs && error.insertedDocs.length > 0) {
-            error.insertedDocs.forEach((doc) =>
+            error.insertedDocs.forEach((doc) => {
               createdResponses.push({
-                id: doc.id, submittedBy: doc.submittedBy, chassisNumber: doc.chassisNumber,
-                parentResponseId: doc.parentResponseId, status: 'success',
-              })
-            );
+                id: doc.id,
+                submittedBy: doc.submittedBy,
+                chassisNumber: doc.chassisNumber,
+                parentResponseId: doc.parentResponseId,
+                status: 'success'
+              });
+            });
           }
           if (error.writeErrors && error.writeErrors.length > 0) {
-            error.writeErrors.forEach((we) =>
-              errors.push({ submittedBy: 'Import row', error: we.errmsg || we.message })
-            );
+            error.writeErrors.forEach((we) => {
+              errors.push({
+                submittedBy: 'Import row',
+                error: we.errmsg || we.message
+              });
+            });
           } else {
-            await Promise.all(
-              chunk.map(async (response) => {
-                try {
-                  if (response.submittedAt) await response.save({ timestamps: false });
-                  else await response.save();
-                  createdResponses.push({
-                    id: response.id, submittedBy: response.submittedBy,
-                    chassisNumber: response.chassisNumber,
-                    parentResponseId: response.parentResponseId, status: 'success',
-                  });
-                } catch (singleErr) {
-                  errors.push({ submittedBy: response.submittedBy, error: singleErr.message });
+            console.error(`[BATCH ${batchId}] Bulk save error (no images), attempting individual fallback:`, error.message);
+            await Promise.all(chunk.map(async (response) => {
+              try {
+                if (response.submittedAt) {
+                  await response.save({ timestamps: false });
+                } else {
+                  await response.save();
                 }
-              })
-            );
+                createdResponses.push({
+                  id: response.id,
+                  submittedBy: response.submittedBy,
+                  chassisNumber: response.chassisNumber,
+                  parentResponseId: response.parentResponseId,
+                  status: 'success'
+                });
+              } catch (singleErr) {
+                errors.push({
+                  submittedBy: response.submittedBy,
+                  error: singleErr.message
+                });
+              }
+            }));
           }
         }
       }
 
+      // Notify form rooms and dashboards immediately
       if (typeof emitBatchImported === 'function') {
-        const batchInfo = { batchId, count: createdResponses.length, total: responses.length, formId: actualQuestionId };
+        const batchInfo = {
+          batchId,
+          count: createdResponses.length,
+          total: responses.length,
+          formId: actualQuestionId,
+        };
         emitBatchImported(actualQuestionId, batchInfo);
-        if (form?.id && String(form.id) !== String(actualQuestionId)) emitBatchImported(form.id, batchInfo);
-        if (form?._id && String(form._id) !== String(actualQuestionId)) emitBatchImported(String(form._id), batchInfo);
+        if (form?.id && String(form.id) !== String(actualQuestionId)) {
+          emitBatchImported(form.id, batchInfo);
+        }
+        if (form?._id && String(form._id) !== String(actualQuestionId)) {
+          emitBatchImported(String(form._id), batchInfo);
+        }
       }
 
+      // Extract sample chassis numbers
       const extractedChassis = [];
       for (const resp of responses) {
         if (resp?.answers) {
           for (const [k, v] of Object.entries(resp.answers)) {
             if (
-              typeof v === 'string' && v.trim() &&
-              (k.toLowerCase().includes('chassis') ||
-                k.toLowerCase().includes('vin') ||
-                k.toLowerCase().includes('id number') ||
-                k === 'chassis_number')
+              typeof v === 'string' &&
+              v.trim() &&
+              (k.toLowerCase().includes('chassis') || k.toLowerCase().includes('vin') || k.toLowerCase().includes('id number') || k === 'chassis_number')
             ) {
-              if (!extractedChassis.includes(v.trim())) extractedChassis.push(v.trim());
+              if (!extractedChassis.includes(v.trim())) {
+                extractedChassis.push(v.trim());
+              }
               if (extractedChassis.length >= 25) break;
             }
           }
@@ -2393,20 +2703,23 @@ export const batchImportResponses = async (req, res) => {
         batchId,
         fileName: req.body.fileName || 'Response_Template.xlsx',
         templateType: batchId.includes('-t2') ? 'Template 2' : batchId.includes('-fu-') ? 'Follow-up Form' : 'Main Form',
-        dataCount: { total: responses.length, success: createdResponses.length, failed: errors.length },
+        dataCount: {
+          total: responses.length,
+          success: createdResponses.length,
+          failed: errors.length
+        },
         details: {
           chassisNumbers: extractedChassis,
-          submitters: Array.from(new Set(responses.map((r) => r.submittedBy).filter(Boolean))),
+          submitters: Array.from(new Set(responses.map(r => r.submittedBy).filter(Boolean))),
           questionsCount: Object.keys(responses[0]?.answers || {}).length,
           errors: errors.slice(0, 10),
-          notes: `Imported ${createdResponses.length} of ${responses.length} responses`,
+          notes: `Imported ${createdResponses.length} of ${responses.length} responses`
         },
-        status: errors.length === 0 ? 'success' : createdResponses.length > 0 ? 'partial' : 'failed',
-      }).catch((err) => console.error('[IMPORT HISTORY LOG ERROR]', err));
+        status: errors.length === 0 ? 'success' : createdResponses.length > 0 ? 'partial' : 'failed'
+      }).catch(err => console.error('[IMPORT HISTORY LOG ERROR]', err));
 
-      clearRankCache(actualQuestionId);
-      clearRankCache(form?.id);
-
+      // Send success response
+      console.log(`[BATCH ${batchId}] Sending success response (no images)`);
       return res.status(201).json({
         success: true,
         message: `Batch import completed: ${createdResponses.length} responses imported successfully`,
@@ -2415,10 +2728,11 @@ export const batchImportResponses = async (req, res) => {
           total: responses.length,
           failed: errors.length,
           createdResponses,
-          errors: errors.length > 0 ? errors : undefined,
-        },
+          errors: errors.length > 0 ? errors : undefined
+        }
       });
     }
+
   } catch (error) {
     console.error('Batch import error:', error);
     return res.status(500).json({
@@ -2428,75 +2742,103 @@ export const batchImportResponses = async (req, res) => {
     });
   }
 };
-
-// ═════════════════════════════════════════════════════════════════════════════
-// checkChassisExists
-// ═════════════════════════════════════════════════════════════════════════════
+/**
+ * Check if a chassis number has already been entered/submitted for a form
+ * Used to prompt the user with a confirmation popup if the chassis already exists
+ */
 export const checkChassisExists = async (req, res) => {
   try {
     const { formId, chassisNumber } = req.query;
+    const { tenantSlug } = req.params;
+
     if (!formId || !chassisNumber) {
-      return res.status(400).json({ success: false, message: 'formId and chassisNumber are required' });
+      return res.status(400).json({
+        success: false,
+        message: 'formId and chassisNumber are required'
+      });
     }
+
     const trimmedChassis = String(chassisNumber).trim();
     if (!trimmedChassis) {
       return res.status(200).json({
         success: true,
-        data: { exists: false, count: 0, chassisNumber: '' },
+        data: { exists: false, count: 0, chassisNumber: '' }
       });
     }
 
     let form = await Form.findOne({ id: formId });
-    if (!form && mongoose.Types.ObjectId.isValid(formId)) form = await Form.findById(formId);
+    if (!form && mongoose.Types.ObjectId.isValid(formId)) {
+      form = await Form.findById(formId);
+    }
 
     const formIds = form ? getThisFormIds(form, formId) : [formId];
     const extraQIds = form ? getThisFormExtraQuestionIds(form) : [];
     const orConditions = buildChassisOrConditions('chassis_number', 'chassis_number_tracking', trimmedChassis, extraQIds);
 
     const query = {
-      $or: [{ questionId: { $in: formIds } }, { formId: { $in: formIds } }],
-      $and: [{ $or: orConditions }],
-      isSectionSubmit: { $ne: true },
+      $or: [
+        { questionId: { $in: formIds } },
+        { formId: { $in: formIds } }
+      ],
+      $and: [
+        { $or: orConditions }
+      ],
+      isSectionSubmit: { $ne: true }
     };
 
     const count = await Response.countDocuments(query);
     let lastSubmission = null;
+
     if (count > 0) {
       const latest = await Response.findOne(query)
         .sort({ createdAt: -1 })
         .select('id _id status submittedBy createdAt biwReview chassisNumber')
         .lean();
+
       if (latest) {
         lastSubmission = {
           id: latest.id || latest._id,
           status: latest.status || 'pending',
           submittedBy: latest.submittedBy || 'Anonymous',
           createdAt: latest.createdAt,
-          biwReview: latest.biwReview?.status || null,
+          biwReview: latest.biwReview?.status || null
         };
       }
     }
 
     return res.status(200).json({
       success: true,
-      data: { exists: count > 0, count, chassisNumber: trimmedChassis, lastSubmission },
+      data: {
+        exists: count > 0,
+        count,
+        chassisNumber: trimmedChassis,
+        lastSubmission
+      }
     });
   } catch (error) {
     console.error('Check chassis exists error:', error);
     res.status(200).json({
       success: true,
       data: {
-        exists: false, count: 0,
+        exists: false,
+        count: 0,
         chassisNumber: String(req.query?.chassisNumber || '').trim(),
-        lastSubmission: null,
-      },
+        lastSubmission: null
+      }
     });
   }
 };
 
-// ═════════════════════════════════════════════════════════════════════════════
-// getFormIdentificationNumbers  (reconstructed)
-// ═════════════════════════════════════════════════════════════════════════════
+/**
+ * Get current rank for a specific question and answer
+ * Used for real-time ranking display during form filling
+ */
+
+/**
+ * Get distinct identification numbers / chassis sequence for a form
+ * Sourced directly from response records so range inputs and filters
+ * can slice exact sequences (e.g. Sep26-KRT-01 to Sep26-KRT-04).
+ */
 export const getFormIdentificationNumbers = async (req, res) => {
   try {
     const { formId: paramFormId, tenantSlug } = req.params;
@@ -2504,188 +2846,217 @@ export const getFormIdentificationNumbers = async (req, res) => {
     const formId = paramFormId || queryFormId;
 
     if (!formId) {
-      return res.status(400).json({ success: false, message: 'formId is required' });
+      return res.status(400).json({
+        success: false,
+        message: 'formId is required'
+      });
     }
 
     let form = await Form.findOne({ id: formId });
-    if (!form && mongoose.Types.ObjectId.isValid(formId)) form = await Form.findById(formId);
-    if (!form) return res.status(404).json({ success: false, message: 'Form not found' });
+    if (!form && mongoose.Types.ObjectId.isValid(formId)) {
+      form = await Form.findById(formId);
+    }
+    if (!form) {
+      form = await Form.findOne({ _id: formId });
+    }
+    if (!form) {
+      return res.status(404).json({
+        success: false,
+        message: 'Form not found'
+      });
+    }
 
     const formIds = getThisFormIds(form, formId);
-    const objIds = formIds
-      .filter((id) => mongoose.Types.ObjectId.isValid(id))
-      .map((id) => new mongoose.Types.ObjectId(id));
+    const objIds = formIds.filter(id => mongoose.Types.ObjectId.isValid(id)).map(id => new mongoose.Types.ObjectId(id));
     const allFormIds = [...formIds, ...objIds];
 
+    // Fetch responses for this form selecting chassisNumber, answers, and createdAt
     const responses = await Response.find({
-      $or: [{ questionId: { $in: allFormIds } }, { formId: { $in: allFormIds } }],
-      isSectionSubmit: { $ne: true },
+      $or: [
+        { questionId: { $in: allFormIds } },
+        { formId: { $in: allFormIds } }
+      ]
     })
       .select('chassisNumber answers createdAt')
       .sort({ createdAt: 1 })
       .lean();
 
-    const allQuestions = [];
-    const collectQ = (qs) => {
-      (qs || []).forEach((q) => {
-        allQuestions.push(q);
-        if (Array.isArray(q.followUpQuestions)) collectQ(q.followUpQuestions);
+    const idQuestionKeys = new Set();
+    if (form.sections) {
+      form.sections.forEach(s => {
+        (s.questions || []).forEach(q => {
+          const t = (q.text || '').toLowerCase();
+          if (
+            q.type === 'range' ||
+            q.type === 'chassis' ||
+            q.type === 'chassisWithZone' ||
+            q.type === 'chassisWithoutZone' ||
+            q.trackResponseRank ||
+            t.includes('chassis') ||
+            t.includes('identification') ||
+            t.includes('id number') ||
+            t.includes('vin')
+          ) {
+            if (q.id) idQuestionKeys.add(q.id);
+            if (q._id) idQuestionKeys.add(String(q._id));
+          }
+        });
       });
-    };
-    (form.sections || []).forEach((s) => collectQ(s.questions));
-    collectQ(form.followUpQuestions);
+    }
 
-    const chassisQuestionIds = allQuestions
-      .filter(
-        (q) =>
-          q.trackResponseRank ||
-          q.type === 'chassisNumber' ||
-          q.type === 'range' ||
-          (q.text &&
-            (q.text.toLowerCase().includes('chassis') ||
-              q.text.toLowerCase().includes('identification') ||
-              q.text.toLowerCase().includes('id number') ||
-              q.text.toLowerCase().includes('vin')))
-      )
-      .map((q) => q.id)
-      .filter(Boolean);
-
-    const identifierKeys = new Set([
-      'chassis_number', 'chassisNumber', 'selected_chassis', 'selectedChassis',
-      'id_number', 'idNumber', 'Identification Number', 'identification_number',
-      'identificationNumber', 'ID number', 'ID Number', 'ID NUMBER', 'ID_NUMBER',
-      'Chassis / VIN', 'Chassis No', 'CHASSIS NUMBER', 'VIN',
-    ]);
+    const commonKeys = [
+      'chassis_number', 'chassisNumber', 'chassis', 'Chassis',
+      'id_number', 'idNumber', 'ID number', 'ID NUMBER', 'Id Number',
+      'Identification Number', 'identification_number', 'identificationNumber',
+      'Chassis / VIN', 'Chassis Number', 'VIN', 'vin'
+    ];
 
     const seen = new Set();
-    const identificationNumbers = [];
+    const orderedList = [];
 
-    for (const resp of responses) {
-      const answersObj = resp.answers instanceof Map ? Object.fromEntries(resp.answers) : resp.answers || {};
-      const candidates = [];
-
-      if (resp.chassisNumber) candidates.push(resp.chassisNumber);
-      for (const key of identifierKeys) {
-        if (answersObj[key] !== undefined && answersObj[key] !== null) {
-          const val = extractAnswerString(answersObj[key]);
-          if (val) candidates.push(val);
+    const addClean = (val) => {
+      if (!val && val !== 0) return;
+      let str = '';
+      if (typeof val === 'object') {
+        const candidate = val.chassisNumber || val.value || val.label || val.id;
+        if (candidate) str = String(candidate).trim();
+      } else {
+        str = String(val).trim();
+      }
+      if (
+        str &&
+        str !== '-' &&
+        str !== 'N/A' &&
+        str !== 'undefined' &&
+        str !== 'null' &&
+        str !== 'No response' &&
+        !str.startsWith('data:image') &&
+        !str.startsWith('{')
+      ) {
+        if (!seen.has(str)) {
+          seen.add(str);
+          orderedList.push(str);
         }
       }
-      for (const qId of chassisQuestionIds) {
-        if (answersObj[qId] !== undefined) {
-          const val = extractAnswerString(answersObj[qId]);
-          if (val) candidates.push(val);
-        }
-        const tracking = answersObj[`${qId}_tracking`];
-        if (tracking !== undefined) {
-          const val = extractAnswerString(tracking);
-          if (val) candidates.push(val);
-        }
-      }
+    };
 
-      for (const raw of candidates) {
-        const trimmed = String(raw).trim();
-        if (!trimmed) continue;
-        const key = trimmed.toLowerCase();
-        if (seen.has(key)) continue;
-        seen.add(key);
-
-        const range = extractRangeBounds(trimmed);
-        if (range && range.start && range.end) {
-          const expanded = expandChassisRange(range.start, range.end);
-          for (const unit of expanded) {
-            const uKey = unit.toLowerCase();
-            if (!seen.has(uKey)) {
-              seen.add(uKey);
-              identificationNumbers.push(unit);
-            }
+    responses.forEach(r => {
+      if (r.chassisNumber) addClean(r.chassisNumber);
+      if (r.answers) {
+        const ansObj = r.answers instanceof Map ? Object.fromEntries(r.answers) : (r.answers || {});
+        for (const [k, v] of Object.entries(ansObj)) {
+          const kLower = k.toLowerCase();
+          if (
+            idQuestionKeys.has(k) ||
+            commonKeys.some(ck => ck.toLowerCase() === kLower) ||
+            kLower.includes('identification') ||
+            kLower.includes('chassis') ||
+            kLower.includes('id number') ||
+            kLower.includes('id_number') ||
+            kLower.includes('vin')
+          ) {
+            addClean(v);
           }
-        } else {
-          identificationNumbers.push(trimmed);
         }
       }
+    });
+
+    if (Array.isArray(form.chassisNumbers)) {
+      form.chassisNumbers.forEach(c => {
+        const str = typeof c === 'string' ? c : (c.chassisNumber || c.name);
+        addClean(str);
+      });
     }
 
     return res.status(200).json({
       success: true,
-      data: {
-        formId,
-        count: identificationNumbers.length,
-        identificationNumbers,
-      },
+      count: orderedList.length,
+      data: orderedList,
+      identificationNumbers: orderedList
     });
   } catch (error) {
-    console.error('getFormIdentificationNumbers error:', error);
-    res.status(500).json({ success: false, message: 'Failed to fetch identification numbers' });
+    console.error('Error fetching form identification numbers:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to fetch form identification numbers',
+      error: error.message
+    });
   }
 };
 
-// ═════════════════════════════════════════════════════════════════════════════
-// getRank  — upgraded with cache + full attempts payload (replaces getFormAttempts)
-// ═════════════════════════════════════════════════════════════════════════════
+// High-performance in-memory cache for instant suggestions & rank lookups (<1ms)
+export const suggestionsMemoryCache = new Map(); // key -> { data, expiresAt }
+export const formMetaCache = new Map(); // formId -> { form, expiresAt }
+export const tenantSlugCache = new Map(); // slug -> { tenantId, expiresAt }
+export const rankResultCache = new Map(); // key -> { payload, expiresAt }
+
 export const getRank = async (req, res) => {
   try {
-    const { formId: queryFormId, questionId, answer } = req.query;
-    const { tenantSlug, formId: paramFormId } = req.params;
-    const { since, chassisNumber } = req.query;
-
-    const formId = paramFormId || queryFormId;
+    const { formId, questionId, answer } = req.query;
+    const { tenantSlug } = req.params;
 
     if (!formId || !questionId || answer === undefined) {
       return res.status(400).json({
         success: false,
-        message: 'formId, questionId, and answer are required',
+        message: 'formId, questionId, and answer are required'
       });
     }
 
     const strAnswer = extractAnswerString(answer);
-    const answerKey = strAnswer.toLowerCase().trim();
-    const cacheKey = `${String(formId)}:${String(questionId)}:${answerKey}`;
+    if (!strAnswer || strAnswer.trim().length < 2) {
+      return res.status(200).json({
+        success: true,
+        data: { rank: 1 }
+      });
+    }
 
-    // Serve from cache unless caller explicitly bypasses via `since`
-    if (!since) {
-      const cached = rankCache.get(cacheKey);
-      if (cached && Date.now() < cached.expiresAt) {
-        return res.status(200).json({ success: true, data: cached.data, cached: true });
-      }
+    const normAnswer = strAnswer.toLowerCase().trim();
+    const rankCacheKey = `${formId}:${questionId}:${normAnswer}:${tenantSlug || ''}`;
+    const cachedRank = rankResultCache.get(rankCacheKey);
+    if (cachedRank && cachedRank.expiresAt > Date.now()) {
+      return res.status(200).json(cachedRank.payload);
     }
 
     let tenantId;
     if (tenantSlug) {
-      const cachedT = tenantSlugCache.get(tenantSlug);
-      if (cachedT && Date.now() < cachedT.expiresAt) {
-        tenantId = cachedT.tenantId;
+      const cachedTId = tenantSlugCache.get(tenantSlug);
+      if (cachedTId && cachedTId.expiresAt > Date.now()) {
+        tenantId = cachedTId.tenantId;
       } else {
-        const tenant = await Tenant.findOne({ slug: tenantSlug, isActive: true }).select('_id').lean();
+        const tenant = await Tenant.findOne({ slug: tenantSlug, isActive: true });
         if (tenant) {
           tenantId = tenant._id;
-          tenantSlugCache.set(tenantSlug, { tenantId, expiresAt: Date.now() + 10 * 60 * 1000 });
+          tenantSlugCache.set(tenantSlug, { tenantId, expiresAt: Date.now() + 300000 });
         }
       }
     }
 
-    let form;
-    const cachedF = formMetaCache.get(String(formId));
-    if (cachedF && Date.now() < cachedF.expiresAt) {
-      form = cachedF.form;
+    // Cached Form lookup (5 min TTL)
+    let form = null;
+    const cachedFormEntry = formMetaCache.get(String(formId));
+    if (cachedFormEntry && cachedFormEntry.expiresAt > Date.now()) {
+      form = cachedFormEntry.form;
     } else {
-      const isObjectId = mongoose.Types.ObjectId.isValid(formId);
-      const formSearchQuery = isObjectId
-        ? { $or: [{ id: formId }, { _id: new mongoose.Types.ObjectId(formId) }] }
-        : { id: formId };
-      form = await Form.findOne(formSearchQuery)
-        .select('id _id title sections followUpQuestions childForms parentFormId tenantId')
-        .lean();
+      form = await Form.findOne({ id: formId });
+      if (!form && mongoose.Types.ObjectId.isValid(formId)) {
+        form = await Form.findById(formId);
+      }
+      if (!form) {
+        form = await Form.findOne({ _id: formId });
+      }
       if (form) {
-        if (formMetaCache.size > 200) formMetaCache.clear();
-        formMetaCache.set(String(formId), { form, expiresAt: Date.now() + 5 * 60 * 1000 });
+        formMetaCache.set(String(formId), { form, expiresAt: Date.now() + 300000 });
       }
     }
 
     if (!form) {
-      return res.status(404).json({ success: false, message: 'Form not found' });
+      return res.status(404).json({
+        success: false,
+        message: 'Form not found',
+      });
     }
 
+    // Find the specific question to check for tracking configuration
     let trackingQId = questionId;
     const findQuestion = (questions) => {
       if (!questions || !Array.isArray(questions)) return null;
@@ -2706,105 +3077,80 @@ export const getRank = async (req, res) => {
         if (question) break;
       }
     }
+
     if (
       question &&
-      (question.trackResponseQuestion === true || question.trackResponseQuestion === 'true')
+      (question.trackResponseQuestion === true ||
+        question.trackResponseQuestion === "true")
     ) {
       trackingQId = `${questionId}_tracking`;
     }
 
-    if (!strAnswer) {
-      const emptyData = {
-        rank: 1,
-        count: 0,
-        history: [],
-        attempts: [],
-        previousStatus: null,
-        lastResponseId: null,
-        isDispatched: false,
-        dispatchedAt: null,
-        dispatchedByName: null,
-        biwReview: null,
-        chatCount: 0,
-        lastSubmittedBy: null,
-        parentMatch: null,
-        followUpStatus: null,
-      };
-      rankCache.set(cacheKey, { data: emptyData, expiresAt: Date.now() + RANK_CACHE_TTL_MS });
-      return res.status(200).json({ success: true, data: emptyData });
-    }
-
+    // Count existing final responses with the EXACT SAME answer for THIS form alone (isolated rank tracking)
     const formIds = getThisFormIds(form, formId);
     const extraQIds = getThisFormExtraQuestionIds(form);
-    const orConditions = buildChassisOrConditions(questionId, trackingQId, strAnswer, extraQIds);
 
-    const query = {
-      $or: [{ questionId: { $in: formIds } }, { formId: { $in: formIds } }],
-      $and: [{ $or: orConditions }],
-      isSectionSubmit: { $ne: true },
-    };
+    const trimmed = String(strAnswer || '').trim();
+    const possibleStrings = Array.from(new Set([
+      trimmed,
+      trimmed.toLowerCase(),
+      trimmed.toUpperCase(),
+      trimmed.charAt(0).toUpperCase() + trimmed.slice(1).toLowerCase()
+    ]));
 
-    const matchingResponses = await Response.find(query)
-      .select(
-        'id _id status answers responseRanks createdAt submittedAt isSectionSubmit isDispatched dispatchedAt dispatchedByName biwReview submittedBy submittedByName createdBy questionId chassisNumber'
-      )
-      .sort({ createdAt: 1 })
-      .lean();
-
-    if (matchingResponses.length === 0) {
-      const isChild = Boolean(form.parentFormId);
-      const parentForm = form.parentFormId
-        ? await Form.findOne({
-          $or: [
-            { id: form.parentFormId },
-            ...(mongoose.Types.ObjectId.isValid(form.parentFormId) ? [{ _id: form.parentFormId }] : []),
-          ],
-        })
-          .select('id _id title')
-          .lean()
-        : null;
-
-      const emptyData = {
-        rank: 1,
-        count: 0,
-        history: [],
-        attempts: [],
-        previousStatus: null,
-        lastResponseId: null,
-        isDispatched: false,
-        dispatchedAt: null,
-        dispatchedByName: null,
-        biwReview: null,
-        chatCount: 0,
-        lastSubmittedBy: null,
-        parentMatch: isChild
-          ? {
-            exists: false,
-            isParentLinked: false,
-            parentFormTitle: parentForm?.title || null,
-            parentFormId: parentForm?.id || parentForm?._id?.toString() || null,
-            attemptsCount: 0,
-            color: 'orange',
-            badgeText: 'New Chassis (No Parent Record Found)',
-            statusLabel: 'Child Only',
-          }
-          : null,
-        followUpStatus: null,
-      };
-      rankCache.set(cacheKey, { data: emptyData, expiresAt: Date.now() + RANK_CACHE_TTL_MS });
-      return res.status(200).json({ success: true, data: emptyData });
+    // ⚡ FAST PATH: Match either chassisNumber or answers for this question within THIS form
+    const answerConditions = [
+      { chassisNumber: { $in: possibleStrings } }
+    ];
+    if (questionId) {
+      answerConditions.push({ [`answers.${questionId}`]: { $in: possibleStrings } });
+      answerConditions.push({ [`answers._${questionId}`]: { $in: possibleStrings } });
+      answerConditions.push({ [`answers.${questionId}.value`]: { $in: possibleStrings } });
+      answerConditions.push({ [`answers.${questionId}.chassisNumber`]: { $in: possibleStrings } });
+    }
+    if (trackingQId && trackingQId !== questionId) {
+      answerConditions.push({ [`answers.${trackingQId}`]: { $in: possibleStrings } });
+      answerConditions.push({ [`answers._${trackingQId}`]: { $in: possibleStrings } });
+      answerConditions.push({ [`answers.${trackingQId}.value`]: { $in: possibleStrings } });
+      answerConditions.push({ [`answers.${trackingQId}.chassisNumber`]: { $in: possibleStrings } });
     }
 
-    const sortedResponses = matchingResponses.sort(
-      (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
-    );
+    const fastQuery = {
+      $or: [
+        { questionId: { $in: formIds } },
+        { formId: { $in: formIds } }
+      ],
+      $and: [
+        { $or: answerConditions }
+      ],
+      isSectionSubmit: { $ne: true }
+    };
 
+    let matchingResponses = await Response.find(fastQuery)
+      .select('id _id status answers createdAt isDispatched dispatchedAt dispatchedByName biwReview submittedBy createdBy tenantId')
+      .lean();
+
+
+
+    const sortedResponses = matchingResponses.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
     let reworkCount = 0;
     let hasBeenReworked = false;
 
     const history = sortedResponses.map((resp, index) => {
-      const answersMap = resp.answers instanceof Map ? Object.fromEntries(resp.answers) : resp.answers || {};
-      const { hasRework, hasReject } = inferSubStatusFromAnswers(answersMap);
+      const answersMap = resp.answers instanceof Map ? Object.fromEntries(resp.answers) : (resp.answers || {});
+      let hasRework = false;
+      let hasReject = false;
+      for (const val of Object.values(answersMap)) {
+        if (val && typeof val === 'object' && val.status) {
+          const s = String(val.status).toLowerCase().trim();
+          if (s === 'rework' || s.includes('rework')) hasRework = true;
+          if (s === 'rejected' || s === 'reject') hasReject = true;
+        } else if (typeof val === 'string') {
+          const s = val.toLowerCase().trim();
+          if (s === 'rework' || s.includes('rework')) hasRework = true;
+          if (s === 'rejected' || s === 'reject') hasReject = true;
+        }
+      }
 
       let status = 'Direct Ok';
       if (hasReject) {
@@ -2828,72 +3174,81 @@ export const getRank = async (req, res) => {
         isDispatched: resp.isDispatched || false,
         dispatchedAt: resp.dispatchedAt || null,
         dispatchedByName: resp.dispatchedByName || null,
-        biwReview: resp.biwReview || null,
-      };
-    });
-
-    // Rich attempts list (same shape as old getFormAttempts)
-    const attempts = sortedResponses.map((resp, index) => {
-      const answersMap = resp.answers instanceof Map ? Object.fromEntries(resp.answers) : resp.answers || {};
-      return {
-        attemptId: String(resp._id || resp.id || index),
-        chassisNumber: resp.chassisNumber || strAnswer || 'UNKNOWN',
-        identificationNumber: resp.chassisNumber || strAnswer || 'UNKNOWN',
-        rank: index + 1,
-        status: history[index].status,
-        answers: sanitizeAnswersForClient(answersMap),
-        submittedBy: resp.submittedByName || resp.submittedBy || 'Inspector',
-        submittedAt: resp.createdAt ? new Date(resp.createdAt).toISOString() : new Date().toISOString(),
+        biwReview: resp.biwReview || null
       };
     });
 
     const count = sortedResponses.length;
-    const lastResponse = sortedResponses[count - 1];
-    const previousStatus = history[count - 1].status;
+    const lastResponse = count > 0 ? sortedResponses[count - 1] : null;
+    const previousStatus = history.length > 0 ? history[history.length - 1].status : (lastResponse ? lastResponse.status : null);
 
-    const responseIds = sortedResponses.map((r) => String(r.id || r._id));
+    const responseIds = sortedResponses.map(r => String(r.id || r._id));
     let chatCount = 0;
     try {
       if (responseIds.length > 0) {
-        chatCount = await ChatMessage.countDocuments({ responseId: { $in: responseIds } });
+        chatCount = await ChatMessage.countDocuments({
+          responseId: { $in: responseIds }
+        });
       }
     } catch (e) {
       console.warn('Chat count query skipped:', e.message);
     }
 
-    const isAnyDispatched = sortedResponses.some((r) => r.isDispatched);
-    const lastDispatched = [...sortedResponses].reverse().find((r) => r.isDispatched);
-    const lastBiwReviewed = [...sortedResponses].reverse().find((r) => r.biwReview && r.biwReview.status);
+    const isAnyDispatched = sortedResponses.some(r => r.isDispatched);
+    const lastDispatched = [...sortedResponses].reverse().find(r => r.isDispatched);
+    const lastBiwReviewed = [...sortedResponses].reverse().find(r => r.biwReview && r.biwReview.status);
 
-    let parentForm = null;
-    if (form.parentFormId) {
-      parentForm = await Form.findOne({
-        $or: [
-          { id: form.parentFormId },
-          ...(mongoose.Types.ObjectId.isValid(form.parentFormId) ? [{ _id: form.parentFormId }] : []),
-        ],
-      })
-        .select('id _id title childForms')
-        .lean();
+    let isReviewFromAssignedTenant = false;
+    if (lastBiwReviewed && lastBiwReviewed.biwReview && lastBiwReviewed.biwReview.status) {
+      const formTenantStr = form.tenantId ? form.tenantId.toString() : null;
+      const reviewerId = lastBiwReviewed.biwReview.reviewedBy ? lastBiwReviewed.biwReview.reviewedBy.toString() : null;
+      const reviewerName = String(lastBiwReviewed.biwReview.reviewedByName || '').toLowerCase();
+      const respTenantStr = lastBiwReviewed.tenantId ? lastBiwReviewed.tenantId.toString() : null;
+
+      if (reviewerName.includes('saify')) {
+        isReviewFromAssignedTenant = true;
+      } else if (respTenantStr && formTenantStr && respTenantStr !== formTenantStr) {
+        isReviewFromAssignedTenant = true;
+      } else if (reviewerId) {
+        try {
+          const revUser = await User.findById(reviewerId).select('tenantId username name').lean();
+          if (revUser && revUser.tenantId && formTenantStr && revUser.tenantId.toString() !== formTenantStr) {
+            isReviewFromAssignedTenant = true;
+          }
+        } catch (_) { }
+      }
     }
-    if (!parentForm) {
-      parentForm = await Form.findOne({
-        'childForms.formId': { $in: [form.id, form._id?.toString(), formId] },
-      })
-        .select('id _id title childForms')
-        .lean();
+
+    // Determine parent/child relationship and compute follow-up badge info
+    let parentForm = null;
+    const parentCacheKey = `parent_${form.id || form._id}`;
+    const cachedParent = formMetaCache.get(parentCacheKey);
+    if (cachedParent && cachedParent.expiresAt > Date.now()) {
+      parentForm = cachedParent.parentForm;
+    } else {
+      if (form.parentFormId) {
+        parentForm = await Form.findOne({
+          $or: [
+            { id: form.parentFormId },
+            ...(mongoose.Types.ObjectId.isValid(form.parentFormId) ? [{ _id: form.parentFormId }] : [])
+          ]
+        }).select('id _id title childForms').lean();
+      }
+      if (!parentForm) {
+        parentForm = await Form.findOne({
+          'childForms.formId': { $in: [form.id, form._id?.toString(), formId] }
+        }).select('id _id title childForms').lean();
+      }
+      formMetaCache.set(parentCacheKey, { parentForm, expiresAt: Date.now() + 300000 });
     }
 
     const isChildForm = Boolean(form.parentFormId || parentForm);
     const isParentForm = Boolean(form.childForms && form.childForms.length > 0);
 
     let followUpBadge = null;
-    {
+    if (matchingResponses.length > 0) {
       const firstRespDate = new Date(sortedResponses[0].createdAt);
-      const daysElapsed = Math.max(
-        0,
-        Math.floor((Date.now() - firstRespDate.getTime()) / (1000 * 60 * 60 * 24))
-      );
+      const daysElapsed = Math.max(0, Math.floor((Date.now() - firstRespDate.getTime()) / (1000 * 60 * 60 * 24)));
 
       let badgeColor = 'green';
       let badgeText = `Linked (${count} ${count === 1 ? 'Attempt' : 'Attempts'})`;
@@ -2922,85 +3277,190 @@ export const getRank = async (req, res) => {
         parentFormId: parentForm?.id || parentForm?._id?.toString() || null,
         attemptsCount: count,
         lastStatus: previousStatus,
-        lastSubmittedBy: lastResponse ? lastResponse.submittedBy || lastResponse.createdBy || null : null,
+        lastSubmittedBy: lastResponse ? (lastResponse.submittedBy || lastResponse.createdBy || null) : null,
         lastCreatedAt: lastResponse ? lastResponse.createdAt : null,
-        daysElapsed,
+        daysElapsed: daysElapsed,
         color: badgeColor,
-        badgeText,
-        statusLabel,
-        history,
+        badgeText: badgeText,
+        statusLabel: statusLabel,
+        history: history
+      };
+    } else {
+      if (isChildForm) {
+        followUpBadge = {
+          exists: false,
+          isParentLinked: false,
+          parentFormTitle: parentForm?.title || null,
+          parentFormId: parentForm?.id || parentForm?._id?.toString() || null,
+          attemptsCount: 0,
+          color: 'orange',
+          badgeText: 'New Chassis (No Parent Record Found)',
+          statusLabel: 'Child Only'
+        };
+      }
+    }
+
+    // Calculate previous tenant's last track rank for this chassis
+    let previousTenantRank = null;
+    const currentTenantIdStr = (req.user?.tenantId ? req.user.tenantId.toString() : null) ||
+      (tenantId ? tenantId.toString() : null) ||
+      (req.query.currentTenantId ? String(req.query.currentTenantId) : null);
+    const formTenantIdStr = form.tenantId ? form.tenantId.toString() : null;
+
+    // Filter responses in current form that belong to a different tenant (e.g. owning tenant)
+    const otherTenantResponsesInForm = sortedResponses.filter(r => {
+      const respTId = r.tenantId ? r.tenantId.toString() : null;
+      if (!respTId) return false;
+      if (currentTenantIdStr) return respTId !== currentTenantIdStr;
+      return formTenantIdStr && respTId === formTenantIdStr;
+    });
+
+    let prevTenantCandidateList = otherTenantResponsesInForm;
+
+    // If no candidate in this form, check parent form or cross-tenant responses for this chassis
+    if (prevTenantCandidateList.length === 0) {
+      try {
+        // ⚡ FAST PATH (Indexed): Query cross-tenant chassisNumber directly (<10ms)
+        const fastCrossQuery = {
+          chassisNumber: { $in: possibleStrings },
+          ...(currentTenantIdStr ? [{ tenantId: { $ne: currentTenantIdStr } }] : []),
+          isSectionSubmit: { $ne: true }
+        };
+        let crossResponses = await Response.find(fastCrossQuery)
+          .select('id _id status answers createdAt isDispatched dispatchedAt dispatchedByName biwReview submittedBy createdBy tenantId')
+          .sort({ createdAt: 1 })
+          .limit(20)
+          .lean();
+
+        // Fast indexed cross-tenant query complete. No full-table scan fallback.
+
+        if (crossResponses.length > 0) {
+          prevTenantCandidateList = crossResponses;
+        }
+      } catch (crossErr) {
+        console.warn('Error checking cross-tenant responses in getRank:', crossErr.message);
+      }
+    }
+
+    if (prevTenantCandidateList.length > 0) {
+      const lastPrev = prevTenantCandidateList[prevTenantCandidateList.length - 1];
+      const pTenantId = lastPrev.tenantId?.toString() || formTenantIdStr;
+      let tenantName = 'Previous Tenant';
+      if (pTenantId) {
+        try {
+          const tDoc = await Tenant.findById(pTenantId).select('name slug').lean();
+          if (tDoc?.name) tenantName = tDoc.name;
+        } catch (_) { }
+      }
+
+      // Compute status for previous tenant's last response
+      const pAnswersMap = lastPrev.answers instanceof Map ? Object.fromEntries(lastPrev.answers) : (lastPrev.answers || {});
+      let pHasRework = false;
+      let pHasReject = false;
+      for (const val of Object.values(pAnswersMap)) {
+        if (val && typeof val === 'object' && val.status) {
+          const s = String(val.status).toLowerCase().trim();
+          if (s === 'rework' || s.includes('rework')) pHasRework = true;
+          if (s === 'rejected' || s === 'reject') pHasReject = true;
+        } else if (typeof val === 'string') {
+          const s = val.toLowerCase().trim();
+          if (s === 'rework' || s.includes('rework')) pHasRework = true;
+          if (s === 'rejected' || s === 'reject') pHasReject = true;
+        }
+      }
+
+      let computedPStatus = 'Direct Ok';
+      if (pHasReject) computedPStatus = 'Rejected';
+      else if (pHasRework) computedPStatus = 'Rework';
+      else if (lastPrev.status && lastPrev.status !== 'pending') computedPStatus = lastPrev.status;
+
+      previousTenantRank = {
+        exists: true,
+        tenantId: pTenantId,
+        tenantName: tenantName,
+        rank: prevTenantCandidateList.length,
+        status: lastPrev.status && lastPrev.status !== 'pending' ? lastPrev.status : computedPStatus,
+        id: lastPrev.id || lastPrev._id?.toString(),
+        responseId: lastPrev.id || lastPrev._id?.toString(),
+        createdAt: lastPrev.createdAt,
+        submittedBy: lastPrev.submittedBy || lastPrev.createdBy || null,
+        isDispatched: Boolean(lastPrev.isDispatched),
+        dispatchedAt: lastPrev.dispatchedAt || null,
+        dispatchedByName: lastPrev.dispatchedByName || null,
+        biwReview: lastPrev.biwReview || null
       };
     }
 
-    // Optional chassis filter (parity with old getFormAttempts behavior)
-    let filteredAttempts = attempts;
-    if (chassisNumber) {
-      const c = String(chassisNumber).trim().toLowerCase();
-      filteredAttempts = attempts.filter((a) => {
-        const cn = String(a.chassisNumber || '').trim().toLowerCase();
-        const idn = String(a.identificationNumber || '').trim().toLowerCase();
-        if (cn === c || idn === c) return true;
-        for (const val of Object.values(a.answers || {})) {
-          if (typeof val === 'string' && val.trim().toLowerCase() === c) return true;
-          if (val && typeof val === 'object') {
-            const v = String(val.value || val.chassisNumber || '').trim().toLowerCase();
-            if (v === c) return true;
-          }
-        }
-        return false;
-      });
-    }
-
     const payload = {
-      rank: count + 1,
-      count,
-      history,
-      attempts: filteredAttempts,
-      previousStatus,
-      lastResponseId: lastResponse.id || lastResponse._id,
-      isDispatched: isAnyDispatched,
-      dispatchedAt: lastDispatched ? lastDispatched.dispatchedAt : null,
-      dispatchedByName: lastDispatched ? lastDispatched.dispatchedByName : null,
-      biwReview: lastBiwReviewed ? lastBiwReviewed.biwReview : null,
-      chatCount,
-      lastSubmittedBy: lastResponse ? lastResponse.submittedBy || lastResponse.createdBy || null : null,
-      parentMatch: followUpBadge,
-      followUpStatus: followUpBadge,
-      generatedAt: new Date().toISOString(),
+      success: true,
+      data: {
+        rank: count + 1,
+        count: count,
+        history: history,
+        previousStatus: previousStatus,
+        lastResponseId: lastResponse ? (lastResponse.id || lastResponse._id) : null,
+        isDispatched: isAnyDispatched,
+        dispatchedAt: lastDispatched ? lastDispatched.dispatchedAt : null,
+        dispatchedByName: lastDispatched ? lastDispatched.dispatchedByName : null,
+        biwReview: lastBiwReviewed ? {
+          ...(lastBiwReviewed.biwReview?.toObject ? lastBiwReviewed.biwReview.toObject() : lastBiwReviewed.biwReview),
+          isFromAssignedTenant: isReviewFromAssignedTenant
+        } : null,
+        chatCount: chatCount,
+        lastSubmittedBy: lastResponse ? (lastResponse.submittedBy || lastResponse.createdBy || null) : null,
+        parentMatch: followUpBadge,
+        followUpStatus: followUpBadge,
+        previousTenantRank: previousTenantRank,
+        formTenantId: form.tenantId ? form.tenantId.toString() : null
+      }
     };
 
-    if (!since) {
-      if (rankCache.size > 2000) rankCache.clear();
-      rankCache.set(cacheKey, { data: payload, expiresAt: Date.now() + RANK_CACHE_TTL_MS });
-    }
+    // Cache result in memory for 30s
+    if (rankResultCache.size > 2000) rankResultCache.clear();
+    rankResultCache.set(rankCacheKey, { payload, expiresAt: Date.now() + 30000 });
 
-    return res.status(200).json({ success: true, data: payload });
+    return res.status(200).json(payload);
+
   } catch (error) {
     console.error('Get rank error:', error);
-    res.status(500).json({ success: false, message: 'Internal server error' });
+    res.status(500).json({
+      success: false,
+      message: 'Internal server error'
+    });
   }
 };
 
-// ═════════════════════════════════════════════════════════════════════════════
-// getSuggestedAnswers
-// ═════════════════════════════════════════════════════════════════════════════
 export const getSuggestedAnswers = async (req, res) => {
+  const startTime = Date.now();
   try {
     const { formId: queryFormId, questionId, answer } = req.query;
     const { tenantSlug, formId: paramFormId } = req.params;
+
     const formId = paramFormId || queryFormId;
 
     if (!formId || !questionId || answer === undefined) {
-      return res.status(400).json({ success: false, message: 'formId, questionId, and answer are required' });
+      return res.status(400).json({
+        success: false,
+        message: 'formId, questionId, and answer are required'
+      });
     }
 
     const strAnswer = extractAnswerString(answer);
-    if (!strAnswer) return res.status(200).json({ success: true, data: { suggestedAnswers: null } });
+    if (!strAnswer) {
+      return res.status(200).json({
+        success: true,
+        data: { suggestedAnswers: null }
+      });
+    }
 
+    // ⚡ INSTANT IN-MEMORY CACHE HIT: Return in <1ms without DB trip!
     const cacheKey = `${formId}:${questionId}:${strAnswer.toLowerCase().trim()}:${tenantSlug || ''}`;
     const cachedEntry = suggestionsMemoryCache.get(cacheKey);
     if (cachedEntry && Date.now() < cachedEntry.expiresAt) {
-      return res.status(200).json({ success: true, data: { suggestedAnswers: cachedEntry.data } });
+      return res.status(200).json({
+        success: true,
+        data: { suggestedAnswers: cachedEntry.data }
+      });
     }
 
     let tenantId;
@@ -3017,26 +3477,33 @@ export const getSuggestedAnswers = async (req, res) => {
       }
     }
 
+    // ⚡ Fast Form Lookup with In-Memory Cache
     let form;
     const cachedF = formMetaCache.get(String(formId));
     if (cachedF && Date.now() < cachedF.expiresAt) {
       form = cachedF.form;
     } else {
-      const isObjectId = mongoose.Types.ObjectId.isValid(formId);
-      const formSearchQuery = isObjectId
-        ? { $or: [{ id: formId }, { _id: new mongoose.Types.ObjectId(formId) }] }
-        : { id: formId };
-      form = await Form.findOne(formSearchQuery)
-        .select('id _id title sections followUpQuestions childForms parentFormId tenantId')
-        .lean();
+      const formSearch = [formId];
+      if (mongoose.Types.ObjectId.isValid(formId)) formSearch.push(new mongoose.Types.ObjectId(formId));
+      form = await Form.findOne({
+        $or: [{ id: { $in: formSearch } }, { _id: { $in: formSearch } }]
+      }).select('id _id title sections followUpQuestions childForms parentFormId tenantId').lean();
+
       if (form) {
         if (formMetaCache.size > 200) formMetaCache.clear();
         formMetaCache.set(String(formId), { form, expiresAt: Date.now() + 5 * 60 * 1000 });
       }
     }
 
-    if (!form) return res.status(404).json({ success: false, message: 'Form not found' });
+    if (!form) {
+      console.warn(`[SUGGESTIONS] Form not found: ${formId}`);
+      return res.status(404).json({
+        success: false,
+        message: 'Form not found'
+      });
+    }
 
+    // Find the specific question to check for tracking configuration
     let trackingQId = questionId;
     const findQuestion = (questions) => {
       if (!questions || !Array.isArray(questions)) return null;
@@ -3049,6 +3516,7 @@ export const getSuggestedAnswers = async (req, res) => {
       }
       return null;
     };
+
     let question = findQuestion(form.followUpQuestions || []);
     if (!question && form.sections && Array.isArray(form.sections)) {
       for (const section of form.sections) {
@@ -3056,21 +3524,31 @@ export const getSuggestedAnswers = async (req, res) => {
         if (question) break;
       }
     }
+
     if (
       question &&
-      (question.trackResponseQuestion === true || question.trackResponseQuestion === 'true')
+      (question.trackResponseQuestion === true ||
+        question.trackResponseQuestion === "true")
     ) {
       trackingQId = `${questionId}_tracking`;
     }
 
+
+    // Get previous responses for THIS form alone (isolated suggestion tracking)
     const formIds = getThisFormIds(form, formId);
     const extraQIds = getThisFormExtraQuestionIds(form);
+
     const orConditions = buildChassisOrConditions(questionId, trackingQId, strAnswer, extraQIds);
 
     const query = {
-      $or: [{ questionId: { $in: formIds } }, { formId: { $in: formIds } }],
-      $and: [{ $or: orConditions }],
-      isSectionSubmit: { $ne: true },
+      $or: [
+        { questionId: { $in: formIds } },
+        { formId: { $in: formIds } }
+      ],
+      $and: [
+        { $or: orConditions }
+      ],
+      isSectionSubmit: { $ne: true }
     };
 
     const matchingResponses = await Response.find(query)
@@ -3080,11 +3558,17 @@ export const getSuggestedAnswers = async (req, res) => {
       .lean();
 
     if (matchingResponses.length === 0) {
-      return res.status(200).json({ success: true, data: { suggestedAnswers: null } });
+      return res.status(200).json({
+        success: true,
+        data: { suggestedAnswers: null }
+      });
     }
 
+    // Sort matching responses: priority to non-partial, then by creation date (oldest first for ranking #1, #2, etc)
     const sortedResponses = matchingResponses.sort((a, b) => {
-      if (a.isSectionSubmit !== b.isSectionSubmit) return a.isSectionSubmit ? 1 : -1;
+      if (a.isSectionSubmit !== b.isSectionSubmit) {
+        return a.isSectionSubmit ? 1 : -1;
+      }
       return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
     });
 
@@ -3093,221 +3577,180 @@ export const getSuggestedAnswers = async (req, res) => {
 
     const suggestions = sortedResponses.map((resp, index) => {
       let answersObj = resp.answers || {};
-      if (answersObj instanceof Map) answersObj = Object.fromEntries(answersObj);
-      const { hasRework, hasReject } = inferSubStatusFromAnswers(answersObj);
+      if (answersObj instanceof Map) {
+        answersObj = Object.fromEntries(answersObj);
+      }
+
+      let hasRework = false;
+      let hasReject = false;
+      for (const val of Object.values(answersObj)) {
+        if (val && typeof val === 'object' && val.status) {
+          const s = String(val.status).toLowerCase().trim();
+          if (s === 'rework' || s.includes('rework')) hasRework = true;
+          if (s === 'rejected' || s === 'reject') hasReject = true;
+        } else if (typeof val === 'string') {
+          const s = val.toLowerCase().trim();
+          if (s === 'rework' || s.includes('rework')) hasRework = true;
+          if (s === 'rejected' || s === 'reject') hasReject = true;
+        }
+      }
 
       let status = 'Direct Ok';
-      if (hasReject) status = 'Rejected';
-      else if (hasRework) {
+      if (hasReject) {
+        status = 'Rejected';
+      } else if (hasRework) {
         reworkCount++;
         hasBeenReworked = true;
         status = `Rework ${reworkCount}`;
-      } else if (index > 0 || hasBeenReworked) status = 'Rework Accepted';
-      else status = 'Direct Ok';
+      } else if (index > 0 || hasBeenReworked) {
+        status = 'Rework Accepted';
+      } else {
+        status = 'Direct Ok';
+      }
 
       return {
         rank: index + 1,
         status: resp.status && resp.status !== 'pending' ? resp.status : status,
         answers: answersObj,
         timestamp: resp.createdAt,
-        id: resp.id || resp._id,
-        attemptId: (resp._id || resp.id).toString(),
-        chassisNumber: strAnswer || resp.chassisNumber || 'UNKNOWN',
-        submittedBy: resp.submittedByName || resp.submittedBy || 'Inspector',
-        submittedAt: resp.createdAt ? new Date(resp.createdAt).toISOString() : new Date().toISOString(),
+        id: resp.id || resp._id
       };
     });
 
     if (suggestionsMemoryCache.size > 2000) suggestionsMemoryCache.clear();
     suggestionsMemoryCache.set(cacheKey, { data: suggestions, expiresAt: Date.now() + 60000 });
 
-    return res.status(200).json({ success: true, data: { suggestedAnswers: suggestions } });
+    return res.status(200).json({
+      success: true,
+      data: { suggestedAnswers: suggestions }
+    });
+
   } catch (error) {
     console.error('[SUGGESTIONS] Error:', error);
-    res.status(500).json({ success: false, message: 'Failed to fetch suggested answers' });
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch suggested answers'
+    });
   }
 };
 
-// ═════════════════════════════════════════════════════════════════════════════
-// batchSyncResponses
-// ═════════════════════════════════════════════════════════════════════════════
-export const batchSyncResponses = async (req, res) => {
-  try {
-    const { responses } = req.body;
-    if (!Array.isArray(responses) || responses.length === 0) {
-      return res.status(400).json({ success: false, message: 'responses array is required' });
-    }
-
-    const results = [];
-    for (const item of responses) {
-      const { idempotencyKey, formId, chassisNumber, answers, clientProvisionalRank, submittedAt, submittedBy } = item;
-
-      let existing = null;
-      if (idempotencyKey) {
-        existing = await Response.findOne({
-          $or: [
-            { 'submissionMetadata.idempotencyKey': idempotencyKey },
-            { 'submissionMetadata.sessionId': idempotencyKey },
-            { sessionId: idempotencyKey },
-          ],
-        }).lean();
-      }
-
-      const chassis = chassisNumber || answers?.chassis_number || answers?.chassisNumber || 'UNKNOWN';
-
-      let form = await Form.findOne({ id: formId });
-      if (!form && mongoose.Types.ObjectId.isValid(formId)) form = await Form.findById(formId);
-      if (!form) {
-        results.push({
-          idempotencyKey: idempotencyKey || null,
-          serverId: null,
-          assignedRank: null,
-          success: false,
-          error: `Form not found: ${formId}`,
-        });
-        continue;
-      }
-
-      const formIds = getThisFormIds(form, formId);
-      const priorCount = await Response.countDocuments({
-        $and: [
-          { $or: [{ questionId: { $in: formIds } }, { formId: { $in: formIds } }] },
-          {
-            $or: [
-              { chassisNumber: chassis },
-              { 'answers.chassis_number': chassis },
-              { 'answers.chassisNumber': chassis },
-            ],
-          },
-        ],
-      });
-
-      if (existing) {
-        results.push({
-          idempotencyKey: idempotencyKey || existing._id.toString(),
-          serverId: existing._id.toString(),
-          assignedRank: existing.rank || (priorCount > 0 ? priorCount : 1),
-          success: true,
-        });
-        continue;
-      }
-
-      const assignedRank = priorCount + 1;
-      let subStatus = 'Direct Ok';
-      if (answers && typeof answers === 'object') {
-        const statuses = Object.values(answers)
-          .map((v) => (typeof v === 'object' && v ? v.status : v))
-          .map((v) => String(v || '').toLowerCase());
-        if (statuses.some((s) => s.includes('reject'))) subStatus = 'Rejected';
-        else if (statuses.some((s) => s.includes('rework'))) subStatus = 'Rework';
-      }
-
-      const newResponse = new Response({
-        id: uuidv4(),
-        tenantId: form.tenantId,
-        questionId: formId,
-        formId,
-        chassisNumber: chassis,
-        rank: assignedRank,
-        answers: answers || {},
-        submittedBy: submittedBy || req.user?.username || 'Inspector Mobile',
-        submittedByName: submittedBy || req.user?.displayName || req.user?.username || 'Inspector',
-        status: subStatus === 'Direct Ok' ? 'pending' : subStatus.toLowerCase(),
-        subStatus,
-        sessionId: idempotencyKey,
-        submissionMetadata: {
-          source: 'mobile-batch-sync',
-          idempotencyKey,
-          clientProvisionalRank,
-        },
-        createdAt: submittedAt ? new Date(submittedAt) : new Date(),
-      });
-
-      await newResponse.save();
-
-      results.push({
-        idempotencyKey: idempotencyKey || newResponse._id.toString(),
-        serverId: newResponse._id.toString(),
-        assignedRank,
-        success: true,
-      });
-    }
-
-    clearRankCache();
-    return res.status(200).json({ success: true, data: { results } });
-  } catch (error) {
-    console.error('[BATCH-SYNC] Error processing batch sync:', error);
-    return res.status(500).json({ success: false, message: 'Failed to process batch sync' });
-  }
-};
-
-// ═════════════════════════════════════════════════════════════════════════════
-// getQuestionPreviousAnswers  ($nin fix for null/empty)
-// ═════════════════════════════════════════════════════════════════════════════
+/**
+ * Get all previous unique answers for a specific question
+ * Used to show suggestions to users as they fill the form
+ */
 export const getQuestionPreviousAnswers = async (req, res) => {
   try {
     const { formId: queryFormId, questionId } = req.query;
     const { tenantSlug, formId: paramFormId } = req.params;
+
     const formId = paramFormId || queryFormId;
 
     if (!formId || !questionId) {
-      return res.status(400).json({ success: false, message: 'formId and questionId are required' });
+      return res.status(400).json({
+        success: false,
+        message: 'formId and questionId are required'
+      });
     }
 
     let tenantId;
     if (tenantSlug) {
       const tenant = await Tenant.findOne({ slug: tenantSlug, isActive: true });
-      if (tenant) tenantId = tenant._id;
+      if (tenant) {
+        tenantId = tenant._id;
+      }
     }
 
+    // Find the form to verify it exists
+    // Find the form to verify it exists
     let form = await Form.findOne({ id: formId });
-    if (!form && mongoose.Types.ObjectId.isValid(formId)) form = await Form.findById(formId);
-    if (!form) return res.status(404).json({ success: false, message: 'Form not found' });
+    if (!form && mongoose.Types.ObjectId.isValid(formId)) {
+      form = await Form.findById(formId);
+    }
+    if (!form) {
+      form = await Form.findOne({ _id: formId });
+    }
+    if (!form) {
+      return res.status(404).json({
+        success: false,
+        message: 'Form not found'
+      });
+    }
 
+    // Use aggregation to find unique answers for this question
+    // Check both normal ID and tracking suffixed ID
     const trackingQuestionId = `${questionId}_tracking`;
     const query = {
       questionId: { $in: [form.id, form._id.toString()] },
       $or: [
-        { [`answers.${questionId}`]: { $exists: true, $nin: [null, ''] } },
-        { [`answers.${trackingQuestionId}`]: { $exists: true, $nin: [null, ''] } },
-        { [`answers._${questionId}`]: { $exists: true, $nin: [null, ''] } },
-        { [`answers._${trackingQuestionId}`]: { $exists: true, $nin: [null, ''] } },
-      ],
+        { [`answers.${questionId}`]: { $exists: true, $ne: null, $ne: "" } },
+        { [`answers.${trackingQuestionId}`]: { $exists: true, $ne: null, $ne: "" } },
+        { [`answers._${questionId}`]: { $exists: true, $ne: null, $ne: "" } },
+        { [`answers._${trackingQuestionId}`]: { $exists: true, $ne: null, $ne: "" } }
+      ]
     };
 
+    // If we have tenantId, filter by it for better accuracy/security
     if (tenantId) {
-      query.tenantId = mongoose.Types.ObjectId.isValid(tenantId)
-        ? new mongoose.Types.ObjectId(tenantId)
-        : tenantId;
+      query.tenantId = mongoose.Types.ObjectId.isValid(tenantId) ? new mongoose.Types.ObjectId(tenantId) : tenantId;
     } else if (form.isGlobal) {
-      // global form — no tenant filter
+      // For global forms without a specific tenant context, we don't filter by tenantId
+      // This allows suggestions across different tenants for global forms
+      console.log(`[SUGGESTIONS] Global form detected, skipping tenantId filter`);
     } else if (form.tenantId) {
-      query.tenantId = mongoose.Types.ObjectId.isValid(form.tenantId)
-        ? new mongoose.Types.ObjectId(form.tenantId)
-        : form.tenantId;
+      // Fallback to form's tenantId if slug wasn't provided but form belongs to a tenant
+      query.tenantId = mongoose.Types.ObjectId.isValid(form.tenantId) ? new mongoose.Types.ObjectId(form.tenantId) : form.tenantId;
     }
 
-    const uniqueAnswers = await Response.distinct(`answers.${questionId}`, query);
-    const uniqueTrackingAnswers = await Response.distinct(`answers.${trackingQuestionId}`, query);
+    console.log(`[SUGGESTIONS] Querying previous answers for Form: ${formId}, Question: ${questionId}, Tenant: ${query.tenantId || 'N/A'}`);
 
-    const allUniqueAnswers = [
-      ...new Set([
-        ...uniqueAnswers.filter((a) => a !== null && a !== undefined && a !== ''),
-        ...uniqueTrackingAnswers.filter((a) => a !== null && a !== undefined && a !== ''),
-      ]),
+    // Use aggregate for more reliable querying of Map fields and unique values
+    // In MongoDB aggregation, fields within a Mongoose Map are accessed like normal nested fields: answers.key
+    const pipeline = [
+      { $match: query },
+      {
+        $project: {
+          vals: [
+            `$answers.${questionId}`,
+            `$answers.${trackingQuestionId}`,
+            `$answers._${questionId}`,
+            `$answers._${trackingQuestionId}`
+          ]
+        }
+      },
+      { $unwind: "$vals" },
+      { $match: { vals: { $ne: null, $ne: "" } } },
+      {
+        $group: {
+          _id: "$vals"
+        }
+      },
+      { $limit: 15 }
     ];
+
+    console.log(`[SUGGESTIONS] Pipeline:`, JSON.stringify(pipeline, null, 2));
+
+    const results = await Response.aggregate(pipeline);
+    console.log(`[SUGGESTIONS] Found ${results.length} unique raw results`);
+
+    const previousAnswers = results.map(r => r._id);
+    console.log(`[SUGGESTIONS] Final answers list:`, previousAnswers);
+
+    // Limit to top 10 unique answers to avoid overwhelming the UI
+    const limitedAnswers = previousAnswers.slice(0, 10);
 
     return res.status(200).json({
       success: true,
-      data: { previousAnswers: allUniqueAnswers, count: allUniqueAnswers.length },
+      data: { answers: limitedAnswers }
     });
+
   } catch (error) {
-    console.error('[SUGGESTIONS] Error:', error);
-    res.status(500).json({ success: false, message: 'Failed to fetch previous answers' });
+    console.error('Get question previous answers error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch previous answers'
+    });
   }
 };
-
-
 
 
 /*export const batchImportResponses = async (req, res) => {
@@ -3502,95 +3945,281 @@ export const getBiwSummary = async (req, res) => {
   try {
     const userRole = req.user?.role || 'admin';
     const userTenantId = req.user?.tenantId;
+    const { formId, formIds: queryFormIds, tenantId, startDate, endDate } = req.query;
+    const rawFormIds = queryFormIds || formId;
+    const formIdList = rawFormIds
+      ? (Array.isArray(rawFormIds) ? rawFormIds : String(rawFormIds).split(',')).map(s => s.trim()).filter(Boolean)
+      : [];
+
+    const effectiveTenantId = (userRole === 'superadmin' && tenantId)
+      ? tenantId
+      : (userTenantId || tenantId);
 
     let formQuery = {};
-    if (userRole !== 'superadmin' && userTenantId) {
-      const isValid = mongoose.Types.ObjectId.isValid(userTenantId);
-      const oid = isValid ? new mongoose.Types.ObjectId(String(userTenantId)) : null;
-      const tenantCondition = oid ? { $in: [userTenantId, String(userTenantId), oid] } : userTenantId;
+    if (formIdList.length > 0) {
+      const validOids = formIdList.filter(id => mongoose.Types.ObjectId.isValid(id)).map(id => new mongoose.Types.ObjectId(id));
       formQuery = {
-        $or: [{ tenantId: tenantCondition }, { isGlobal: true }]
+        $or: [
+          { id: { $in: formIdList } },
+          ...(validOids.length > 0 ? [{ _id: { $in: validOids } }] : [])
+        ]
+      };
+    } else if (effectiveTenantId) {
+      const isValid = mongoose.Types.ObjectId.isValid(effectiveTenantId);
+      const oid = isValid ? new mongoose.Types.ObjectId(String(effectiveTenantId)) : null;
+      const tenantCondition = oid ? { $in: [effectiveTenantId, String(effectiveTenantId), oid] } : effectiveTenantId;
+      formQuery = {
+        $or: [{ tenantId: tenantCondition }, { isGlobal: true }, { sharedWithTenants: tenantCondition }]
       };
     }
 
     const forms = await Form.find(formQuery).select('id _id').lean();
-    const formIds = forms.flatMap(f => [f.id, f._id ? f._id.toString() : null]).filter(Boolean);
+    const resolvedFormIds = forms.flatMap(f => [f.id, f._id ? f._id.toString() : null]).filter(Boolean);
+    formIdList.forEach(id => {
+      if (!resolvedFormIds.includes(id)) resolvedFormIds.push(id);
+    });
 
     let respQuery = {};
-    if (userRole !== 'superadmin' && userTenantId) {
-      const isValid = mongoose.Types.ObjectId.isValid(userTenantId);
-      const oid = isValid ? new mongoose.Types.ObjectId(String(userTenantId)) : null;
-      const tenantCondition = oid ? { $in: [userTenantId, String(userTenantId), oid] } : userTenantId;
-
-      respQuery = {
-        $or: [
-          { tenantId: tenantCondition },
-          ...(formIds.length > 0 ? [{ questionId: { $in: formIds } }] : [])
-        ]
-      };
-    } else if (formIds.length > 0) {
-      respQuery.questionId = { $in: formIds };
+    if (resolvedFormIds.length > 0) {
+      respQuery = { questionId: { $in: resolvedFormIds }, isSectionSubmit: { $ne: true } };
+    } else if (effectiveTenantId) {
+      const isValid = mongoose.Types.ObjectId.isValid(effectiveTenantId);
+      const oid = isValid ? new mongoose.Types.ObjectId(String(effectiveTenantId)) : null;
+      const tenantCondition = oid ? { $in: [effectiveTenantId, String(effectiveTenantId), oid] } : effectiveTenantId;
+      respQuery = { tenantId: tenantCondition, isSectionSubmit: { $ne: true } };
     }
 
-    // Fast query returning lean response docs
-    const responses = await Response.find(respQuery)
-      .select('submittedBy createdBy isDispatched biwReview status answers')
-      .sort({ createdAt: -1 })
-      .lean();
-
-    console.log(`[BIW] Total responses found: ${responses.length}`);
-
-    // Group by user
-    const byUser = new Map();
-
-    responses.forEach(response => {
-      const name = (response.submittedBy || response.createdBy || 'Anonymous').trim();
-
-      if (!name || name === 'Excel Import' || name === 'System' || name === 'Admin Import' || name === '-') {
-        return;
+    // Add date filtering if startDate or endDate provided
+    if (startDate || endDate) {
+      const dateFilterQuery = {};
+      if (startDate) {
+        const sDate = new Date(startDate);
+        sDate.setUTCHours(0, 0, 0, 0);
+        const sDateBuffer = new Date(sDate.getTime() - 6 * 3600 * 1000);
+        dateFilterQuery.$gte = sDateBuffer;
+      }
+      if (endDate) {
+        const eDate = new Date(endDate);
+        eDate.setUTCHours(23, 59, 59, 999);
+        const eDateBuffer = new Date(eDate.getTime() + 12 * 3600 * 1000);
+        dateFilterQuery.$lte = eDateBuffer;
       }
 
-      if (!byUser.has(name)) {
-        byUser.set(name, {
-          name,
-          totalSubmitted: 0,
-          dispatched: 0,
-          accepted: 0,
-          rejected: 0,
-          rework: 0
-        });
+      const dateClause = {
+        $or: [
+          { createdAt: dateFilterQuery },
+          { submittedAt: dateFilterQuery }
+        ]
+      };
+
+      if (respQuery.$or) {
+        respQuery = {
+          $and: [
+            { $or: respQuery.$or },
+            dateClause
+          ]
+        };
+      } else {
+        respQuery = {
+          ...respQuery,
+          ...dateClause
+        };
       }
+    }
 
-      const stats = byUser.get(name);
-      stats.totalSubmitted += 1;
-      if (response.isDispatched) stats.dispatched += 1;
+    // High-performance MongoDB aggregation pipeline - executes on DB engine in <1.5s
+    const [summaryAgg, inspectorAgg] = await Promise.all([
+      Response.aggregate([
+        { $match: respQuery },
+        {
+          $group: {
+            _id: null,
+            totalSubmitted: { $sum: 1 },
+            dispatched: {
+              $sum: {
+                $cond: [
+                  {
+                    $or: [
+                      { $eq: ['$isDispatched', true] },
+                      { $and: [{ $ne: ['$dispatchedAt', null] }, { $gt: ['$dispatchedAt', ''] }] }
+                    ]
+                  },
+                  1,
+                  0
+                ]
+              }
+            },
+            accepted: {
+              $sum: {
+                $cond: [
+                  {
+                    $or: [
+                      { $eq: [{ $toLower: '$biwReview.status' }, 'accepted'] },
+                      { $eq: [{ $toLower: '$biwReview.status' }, 'direct ok'] },
+                      { $eq: [{ $toLower: '$status' }, 'accepted'] },
+                      { $eq: [{ $toLower: '$status' }, 'direct ok'] }
+                    ]
+                  },
+                  1,
+                  0
+                ]
+              }
+            },
+            rejected: {
+              $sum: {
+                $cond: [
+                  {
+                    $or: [
+                      { $eq: [{ $toLower: '$biwReview.status' }, 'rejected'] },
+                      { $eq: [{ $toLower: '$status' }, 'rejected'] }
+                    ]
+                  },
+                  1,
+                  0
+                ]
+              }
+            },
+            rework: {
+              $sum: {
+                $cond: [
+                  {
+                    $or: [
+                      { $eq: [{ $toLower: '$biwReview.status' }, 'reworked'] },
+                      { $eq: [{ $toLower: '$biwReview.status' }, 'rework'] },
+                      { $eq: [{ $toLower: '$status' }, 'reworked'] },
+                      { $eq: [{ $toLower: '$status' }, 'rework'] }
+                    ]
+                  },
+                  1,
+                  0
+                ]
+              }
+            }
+          }
+        }
+      ]),
+      Response.aggregate([
+        {
+          $match: {
+            ...respQuery,
+            submittedBy: { $nin: [null, ''] }
+          }
+        },
+        {
+          $group: {
+            _id: { $trim: { input: { $ifNull: ['$submittedBy', '$createdBy'] } } },
+            totalSubmitted: { $sum: 1 },
+            dispatched: {
+              $sum: {
+                $cond: [
+                  {
+                    $or: [
+                      { $eq: ['$isDispatched', true] },
+                      { $and: [{ $ne: ['$dispatchedAt', null] }, { $gt: ['$dispatchedAt', ''] }] }
+                    ]
+                  },
+                  1,
+                  0
+                ]
+              }
+            },
+            accepted: {
+              $sum: {
+                $cond: [
+                  {
+                    $or: [
+                      { $eq: [{ $toLower: '$biwReview.status' }, 'accepted'] },
+                      { $eq: [{ $toLower: '$biwReview.status' }, 'direct ok'] },
+                      { $eq: [{ $toLower: '$status' }, 'accepted'] },
+                      { $eq: [{ $toLower: '$status' }, 'direct ok'] }
+                    ]
+                  },
+                  1,
+                  0
+                ]
+              }
+            },
+            rejected: {
+              $sum: {
+                $cond: [
+                  {
+                    $or: [
+                      { $eq: [{ $toLower: '$biwReview.status' }, 'rejected'] },
+                      { $eq: [{ $toLower: '$status' }, 'rejected'] }
+                    ]
+                  },
+                  1,
+                  0
+                ]
+              }
+            },
+            rework: {
+              $sum: {
+                $cond: [
+                  {
+                    $or: [
+                      { $eq: [{ $toLower: '$biwReview.status' }, 'reworked'] },
+                      { $eq: [{ $toLower: '$biwReview.status' }, 'rework'] },
+                      { $eq: [{ $toLower: '$status' }, 'reworked'] },
+                      { $eq: [{ $toLower: '$status' }, 'rework'] }
+                    ]
+                  },
+                  1,
+                  0
+                ]
+              }
+            }
+          }
+        },
+        { $sort: { totalSubmitted: -1 } }
+      ])
+    ]);
 
-      // Extract review status from biwReview first, or fallback to response.status
-      const biwStatus = response.biwReview?.status;
-      const rawStatus = biwStatus || response.status;
-      const statusStr = String(rawStatus || '').toLowerCase().trim();
-
-      if (statusStr.includes('accept') || statusStr.includes('direct ok') || statusStr.includes('ok') || statusStr === 'verified') {
-        stats.accepted += 1;
-      } else if (statusStr.includes('reject')) {
-        stats.rejected += 1;
-      } else if (statusStr.includes('rework')) {
-        stats.rework += 1;
-      }
+    const result = inspectorAgg.map(s => {
+      const name = s._id || 'Unknown';
+      const accepted = s.accepted || 0;
+      const rejected = s.rejected || 0;
+      const rework = s.rework || 0;
+      const totalReviewed = accepted + rejected + rework;
+      const performanceScore = totalReviewed > 0 ? Math.round((accepted / totalReviewed) * 100) : 0;
+      return {
+        name,
+        totalSubmitted: s.totalSubmitted || 0,
+        dispatched: s.dispatched || 0,
+        accepted,
+        rejected,
+        rework,
+        totalReviewed,
+        performanceScore
+      };
     });
 
-    const result = Array.from(byUser.values()).map(stats => {
-      const totalReviewed = stats.accepted + stats.rejected + stats.rework;
-      const performanceScore = totalReviewed > 0
-        ? Math.round((stats.accepted / totalReviewed) * 100)
-        : 0;
-      return { ...stats, totalReviewed, performanceScore };
-    });
+    const rawSummary = summaryAgg[0] || {};
+    const totalSubmitted = rawSummary.totalSubmitted || 0;
+    const dispatched = rawSummary.dispatched || 0;
+    const accepted = rawSummary.accepted || 0;
+    const rejected = rawSummary.rejected || 0;
+    const rework = rawSummary.rework || 0;
+    const totalReviewed = accepted + rejected + rework;
+    const performanceScore = totalReviewed > 0 ? Math.round((accepted / totalReviewed) * 100) : 100;
+
+    const summary = {
+      totalSubmitted,
+      dispatched,
+      accepted,
+      rejected,
+      rework,
+      totalReviewed,
+      performanceScore,
+      inspectors: result.length,
+      totalResponses: totalSubmitted
+    };
 
     res.json({
       success: true,
       data: result,
-      totalResponses: responses.length
+      summary,
+      totalResponses: totalSubmitted
     });
 
   } catch (error) {
@@ -3615,8 +4244,7 @@ export const getAllResponses = async (req, res) => {
       search,
       startDate,
       endDate,
-      includePartial = 'false',
-      dispatchedOnly = 'false'
+      includePartial = 'false'
     } = req.query;
 
     let query = {};
@@ -3752,12 +4380,6 @@ export const getAllResponses = async (req, res) => {
         }
       ]
     };
-
-    // Received a server-side dispatched-only filter? Apply isDispatched: true
-    // to the match (existing tenant scoping stays intact).
-    if (String(dispatchedOnly).toLowerCase() === 'true') {
-      query.isDispatched = true;
-    }
 
     // Run find + count in parallel for speed
     const [responses, total] = await Promise.all([
@@ -3939,103 +4561,71 @@ export const updateResponse = async (req, res) => {
       }
     }
     if (req.body.isDispatched !== undefined) {
-      const isAdminRole = req.user.role === 'admin' || req.user.role === 'superadmin';
+      // ✅ Security: Only the form's creator tenant, creator user, or superadmin can dispatch or revoke dispatch
+      const targetFormId = response.formId || response.questionId;
+      const formDoc = await Form.findOne(
+        mongoose.Types.ObjectId.isValid(targetFormId)
+          ? { $or: [{ _id: targetFormId }, { id: targetFormId }] }
+          : { id: targetFormId }
+      ).select('tenantId createdBy');
 
-      const isOwnTenant =
-        isAdminRole ||
-        (response.tenantId && response.tenantId.toString() === req.user.tenantId?.toString());
+      const userTenantStr = req.user?.tenantId ? String(req.user.tenantId) : '';
+      const formTenantStr = formDoc?.tenantId ? String(formDoc.tenantId) : '';
+      const formCreatorUserStr = formDoc?.createdBy ? String(formDoc.createdBy) : '';
+      const currentUserIdStr = req.user?._id ? String(req.user._id) : '';
 
-      // The mobile app is the source of truth for the computed inspection status:
-      // its InspectionStatusHelper.computeStatus is group-aware (rework history,
-      // group index) and cannot be faithfully reproduced server-side without
-      // loading the full response history for the identification number.
-      //
-      // So we accept the client-declared status as a HINT, verify it is one of
-      // the dispatchable ones, and additionally sanity-check against the raw
-      // answer map (at least one accepted answer must be present) so a hostile
-      // client can't dispatch a response where nothing was accepted.
-      const clientComputedStatus =
-        typeof req.body.computedStatus === 'string'
-          ? req.body.computedStatus.trim()
-          : null;
+      const isSuperadmin = req.user?.role === 'superadmin';
+      const isCreatorTenant = formTenantStr && userTenantStr && formTenantStr === userTenantStr;
+      const isCreatorUser = formCreatorUserStr && currentUserIdStr && formCreatorUserStr === currentUserIdStr;
 
-      const DISPATCHABLE = new Set([
-        'Direct Ok',
-        'Accepted',
-        'Rework Accepted',
-        'Rework Completed',
-      ]);
-
-      // Sanity check from raw answers: at least one value must be a real
-      // accepted/verified/rework-completed status (so we can't dispatch an
-      // empty or all-rejected response just because the client lied).
-      const values =
-        typeof response.answers?.values === 'function'
-          ? Array.from(response.answers.values())
-          : Object.values(response.answers || {});
-
-      const ACCEPTED_VALUES = new Set(['accepted', 'verified', 'rework completed']);
-      let anyAccepted = false;
-      for (const val of values) {
-        const s = typeof val === 'object' && val !== null
-          ? String(val.status ?? '').toLowerCase().trim()
-          : '';
-        if (ACCEPTED_VALUES.has(s)) { anyAccepted = true; break; }
+      if (!isSuperadmin && !isCreatorTenant && !isCreatorUser) {
+        return res.status(403).json({
+          success: false,
+          message: 'Only the creator tenant of this form can dispatch this chassis'
+        });
       }
 
-      const isDispatchable =
-        clientComputedStatus !== null &&
-        DISPATCHABLE.has(clientComputedStatus) &&
-        anyAccepted;
+      if (req.body.isDispatched === true && !response.isDispatched) {
+        const biwStatus = String(response.biwReview?.status || '').toLowerCase();
+        const tvsStatus = String(response.review?.reviewOption || response.review?.status || '').toLowerCase();
+        if (
+          biwStatus === 'rework' ||
+          biwStatus === 'reworked' ||
+          biwStatus === 'rejected' ||
+          tvsStatus === 'rework' ||
+          tvsStatus === 'rejected'
+        ) {
+          return res.status(400).json({
+            success: false,
+            message: 'Cannot dispatch this chassis because it has an active Rework or Rejected review. It must be Accepted first.'
+          });
+        }
 
-      console.log('[DISPATCH]', {
-        clientComputedStatus,
-        isDispatchable,
-        isOwnTenant,
-        already: response.isDispatched,
-        incoming: req.body.isDispatched,
-        anyAccepted,
-      });
-
-      if (req.body.isDispatched === true && !response.isDispatched && isOwnTenant && isDispatchable) {
         response.isDispatched = true;
         response.dispatchedAt = new Date();
         response.dispatchedBy = req.user._id;
         response.dispatchedByName =
           `${req.user.firstName || ''} ${req.user.lastName || ''}`.trim() ||
-          req.user.username || req.user.email || 'Unknown user';
-      } else if (req.body.isDispatched === true && !isDispatchable) {
-        return res.status(400).json({
-          success: false,
-          message: `Cannot dispatch — client computed status "${clientComputedStatus ?? 'unknown'}" is not dispatchable`,
-        });
+          req.user.username ||
+          req.user.email ||
+          'Unknown user';
       } else if (req.body.isDispatched === false) {
-        if (!isAdminRole) {
-          return res.status(403).json({ success: false, message: 'Only admins can un-dispatch a response' });
-        }
         response.isDispatched = false;
         response.dispatchedAt = null;
         response.dispatchedBy = null;
         response.dispatchedByName = null;
       }
     }
-    // ✅ BIW Review — allow inspectors (and subadmins/admins/superadmins)
-    // on dispatched responses, including cross-tenant responses where the
-    // form is shared with the reviewer's tenant. reviewedBy/reviewedAt are
+
+    // ✅ BIW Review — any reviewer other than the response's own submitter
+    // can Accept / Reject / Rework. Send `{ biwReview: { status } }` to set
+    // it, or `{ biwReview: null }` to clear it. reviewedBy/reviewedAt are
     // always set server-side from the authenticated user, never trusted
     // from the client.
     if (req.body.hasOwnProperty('biwReview')) {
       const biwReview = req.body.biwReview;
 
       if (biwReview === null || biwReview === undefined) {
-        // Clearing a review is admin/superadmin-only.
-        const isAdminRole = req.user.role === 'admin' || req.user.role === 'superadmin';
-        if (!isAdminRole) {
-          return res.status(403).json({
-            success: false,
-            message: 'Only admins can clear a BIW review'
-          });
-        }
         response.biwReview = undefined;
       } else {
         const allowedStatuses = ['Accepted', 'Rejected', 'Reworked'];
@@ -4046,34 +4636,90 @@ export const updateResponse = async (req, res) => {
           });
         }
 
-        // Reviewer must be an inspector/subadmin/admin/superadmin.
-        const isInspectorRole = req.user.role === 'inspector' || req.user.role === 'subadmin';
-        const isAdminRole = req.user.role === 'admin' || req.user.role === 'superadmin';
-        if (!isInspectorRole && !isAdminRole) {
-          return res.status(403).json({
-            success: false,
-            message: 'Only inspectors or admins can submit a BIW review'
-          });
-        }
-
-        // Dispatched-only rule.
-        if (response.isDispatched !== true) {
-          return res.status(403).json({
-            success: false,
-            message: 'BIW review is only available on dispatched responses'
-          });
-        }
-
-        // Anti-self-review rule.
-        const userEmail = req.user.email || '';
-        const userUsername = req.user.username || '';
+        const userEmail = (req.user.email || '').toLowerCase();
+        const userUsername = (req.user.username || '').toLowerCase();
         const userIdStr = req.user._id ? req.user._id.toString() : '';
         const creatorIdStr = originalCreatedBy ? originalCreatedBy.toString() : '';
+        const isSuperAdmin = req.user.role === 'superadmin';
+        const isExcelImport = originalSubmittedBy === 'Excel Import';
+
+        // Check if form has chassisTenantAssignments
+        if (!isSuperAdmin) {
+          const Form = mongoose.model('Form');
+          const formQueryOr = [];
+          if (response.formId) {
+            if (mongoose.Types.ObjectId.isValid(response.formId)) formQueryOr.push({ _id: response.formId });
+            formQueryOr.push({ id: response.formId });
+          }
+          if (response.questionId) {
+            if (mongoose.Types.ObjectId.isValid(response.questionId)) formQueryOr.push({ _id: response.questionId });
+            formQueryOr.push({ id: response.questionId });
+          }
+          const formObj = formQueryOr.length > 0 ? await Form.findOne({ $or: formQueryOr }).lean() : null;
+
+          let parentDoc = null;
+          if (formObj) {
+            const formIds = [formObj.id, formObj._id?.toString(), response.formId, response.questionId].filter(Boolean);
+            const parentQuery = [
+              { 'childForms.formId': { $in: formIds } },
+              { 'childForms.id': { $in: formIds } }
+            ];
+            const pId = formObj.parentFormId || formObj.parentForm?.id || formObj.parentForm?._id;
+            if (pId) {
+              if (mongoose.Types.ObjectId.isValid(pId)) parentQuery.push({ _id: pId });
+              parentQuery.push({ id: pId });
+            }
+            parentDoc = await Form.findOne({ $or: parentQuery }).lean();
+          }
+
+          const assignmentsToCheck = (formObj && Array.isArray(formObj.chassisTenantAssignments) && formObj.chassisTenantAssignments.length > 0)
+            ? formObj.chassisTenantAssignments
+            : (parentDoc?.chassisTenantAssignments || []);
+
+          if (assignmentsToCheck.length > 0) {
+            const respChassisCandidates = extractResponseChassisCandidates(response);
+
+            const assignment = assignmentsToCheck.find(a => {
+              const aChassis = String(a.chassisNumber || '').trim().toLowerCase();
+              return aChassis && respChassisCandidates.includes(aChassis);
+            });
+
+            if (assignment && Array.isArray(assignment.assignedTenants) && assignment.assignedTenants.length > 0) {
+              const userTenantIdStr = req.user.tenantId ? req.user.tenantId.toString() : '';
+              const isAssigned = assignment.assignedTenants.some(t => String(t?._id || t?.id || t) === userTenantIdStr);
+              const isFormOwner = (formObj?.tenantId && formObj.tenantId.toString() === userTenantIdStr) ||
+                (parentDoc?.tenantId && parentDoc.tenantId.toString() === userTenantIdStr);
+              const isSharedTenant = (Array.isArray(formObj?.sharedWithTenants) && formObj.sharedWithTenants.some(t => String(t?._id || t?.id || t) === userTenantIdStr)) ||
+                (Array.isArray(parentDoc?.sharedWithTenants) && parentDoc.sharedWithTenants.some(t => String(t?._id || t?.id || t) === userTenantIdStr));
+              const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
+
+              if (!isAssigned && !isFormOwner && !isSharedTenant && !isAdmin) {
+                return res.status(403).json({
+                  success: false,
+                  message: 'Only assigned tenant reviewers can perform BIW review for this chassis.'
+                });
+              }
+            }
+          }
+        }
+
+        const subBy = String(originalSubmittedBy || '').toLowerCase();
+        const crBy = String(originalCreatedBy || '').toLowerCase();
+        const contactEmail = String(originalSubmitterContact?.email || '').toLowerCase();
+        const isAdminOrSuperAdmin = req.user.role === 'superadmin' || req.user.role === 'admin';
+
         const isSubmitter =
-          (originalSubmittedBy === userEmail ||
-            originalSubmittedBy === userUsername ||
-            (originalSubmitterContact && originalSubmitterContact.email === userEmail) ||
-            (creatorIdStr && creatorIdStr === userIdStr));
+          !isAdminOrSuperAdmin &&
+          !isExcelImport &&
+          (
+            (userEmail && subBy === userEmail) ||
+            (userUsername && subBy === userUsername) ||
+            (userEmail && crBy === userEmail) ||
+            (userUsername && crBy === userUsername) ||
+            (userEmail && contactEmail === userEmail) ||
+            (creatorIdStr && creatorIdStr === userIdStr)
+          );
+
         if (isSubmitter) {
           return res.status(403).json({
             success: false,
@@ -4081,79 +4727,32 @@ export const updateResponse = async (req, res) => {
           });
         }
 
-        // Cross-tenant access: resolve the owning form and check whether the
-        // reviewer's tenant owns it, shares it, has a chassis-level share, or
-        // the form is global.
-        let isOwnTenant = false;
-        try {
-          const formQuery = {
-            $or: [
-              { id: response.questionId },
-              ...(mongoose.Types.ObjectId.isValid(response.questionId)
-                ? [{ _id: response.questionId }]
-                : []),
-            ],
-          };
-          const form = await Form.findOne(formQuery)
-            .select('sharedWithTenants chassisTenantAssignments isGlobal tenantId')
-            .lean();
-
-          if (form) {
-            const userTenantIdStr = req.user.tenantId ? req.user.tenantId.toString() : null;
-            const formTenantIdStr = form.tenantId ? form.tenantId.toString() : null;
-
-            const tenantIdOf = (t) => {
-              if (t == null) return null;
-              if (typeof t === 'object' && t._id != null) return t._id.toString();
-              return t.toString();
-            };
-
-            const isSharedTenant =
-              Array.isArray(form.sharedWithTenants) &&
-              form.sharedWithTenants.some((t) => tenantIdOf(t) === userTenantIdStr);
-
-            const hasChassisShare =
-              Array.isArray(form.chassisTenantAssignments) &&
-              form.chassisTenantAssignments.some(
-                (a) =>
-                  Array.isArray(a.assignedTenants) &&
-                  a.assignedTenants.some((t) => tenantIdOf(t) === userTenantIdStr),
-              );
-
-            isOwnTenant =
-              !userTenantIdStr ||
-              formTenantIdStr === userTenantIdStr ||
-              isSharedTenant ||
-              hasChassisShare ||
-              form.isGlobal === true;
-
-            console.log('[BIW ACCESS]', {
-              userTenantId: userTenantIdStr,
-              formTenantId: formTenantIdStr,
-              isSharedTenant,
-              hasChassisShare,
-              isGlobal: form.isGlobal,
-              granted: isOwnTenant,
-            });
-          } else {
-            console.warn('[BIW ACCESS] form not found for questionId =', response.questionId);
-          }
-        } catch (err) {
-          console.warn('[updateResponse] Could not resolve form for BIW access check:', err.message);
-        }
-
-        if (!isOwnTenant) {
-          return res.status(403).json({ success: false, message: 'This form is not shared with your tenant' });
-        }
-
         response.biwReview = {
           status: biwReview.status,
           reviewedBy: req.user._id,
-          reviewedByName: req.user.username || req.user.email || 'Reviewer',
+          reviewedByName: `${req.user.firstName || ''} ${req.user.lastName || ''}`.trim() || req.user.name || userUsername || userEmail || 'Reviewer',
           reviewedAt: new Date(),
-          remark: biwReview.remark,
-          evidenceUrl: biwReview.evidenceUrl,
-          flaggedQuestions: biwReview.flaggedQuestions
+          remark: biwReview.remark || '',
+          reason: biwReview.reason || '',
+          evidenceUrl: biwReview.evidenceUrl || '',
+          flaggedQuestions: Array.isArray(biwReview.flaggedQuestions) ? biwReview.flaggedQuestions : []
+        };
+      }
+    }
+
+    if (req.body.hasOwnProperty('review')) {
+      const reviewObj = req.body.review;
+      if (reviewObj === null || reviewObj === undefined) {
+        response.review = undefined;
+      } else {
+        const revOption = String(reviewObj.reviewOption || reviewObj.status || '');
+        response.review = {
+          ...reviewObj,
+          status: reviewObj.status || reviewObj.reviewOption || 'pending',
+          reviewOption: reviewObj.reviewOption || reviewObj.status,
+          reviewedBy: req.user._id,
+          reviewedByName: userUsername || userEmail || 'Reviewer',
+          reviewedAt: new Date()
         };
       }
     }
@@ -4175,16 +4774,10 @@ export const updateResponse = async (req, res) => {
     };
 
     // Emit real-time event for updated response
-    emitResponseUpdated(response.questionId, {
-      id: response.id,
-      questionId: response.questionId,
-      status: response.status,
-      submittedBy: response.submittedBy,
-      createdAt: response.createdAt,
-      updatedAt: response.updatedAt,
-      answers: Object.fromEntries(response.answers),
-      responseRanks: response.responseRanks ? Object.fromEntries(response.responseRanks) : {}
-    });
+    emitResponseUpdated(response.questionId, formattedResponse);
+    if (response.formId && String(response.formId) !== String(response.questionId)) {
+      emitResponseUpdated(String(response.formId), formattedResponse);
+    }
 
     res.json({
       success: true,
@@ -4289,7 +4882,7 @@ export const autoFillChassisNumbers = async (req, res) => {
 
     const result = await Response.updateMany(
       query,
-      { $set: { 'answers.chassis_number': defaultValue } }
+      { $set: { 'answers.chassis_number': defaultValue, chassisNumber: defaultValue } }
     );
 
     console.log(`[AUTO-FILL CHASSIS] Form ${formId}: matched ${result.matchedCount}, modified ${result.modifiedCount}, default "${defaultValue}"`);
@@ -4371,16 +4964,11 @@ export const deleteResponse = async (req, res) => {
       });
     }
 
-    const questionId = response.questionId || response.formId;
+    const questionId = response.questionId;
     await Response.findOneAndDelete({ _id: response._id });
 
     // Emit real-time event for deleted response (using response.id which is the UUID expected by frontend socket listener)
-    emitResponseDeleted(questionId, response.id || response._id.toString());
-
-    // Invalidate server memory cache so subsequent requests return fresh results
-    suggestionsMemoryCache.clear();
-    invalidateCache('responses');
-    if (questionId) invalidateCache(String(questionId));
+    emitResponseDeleted(questionId, response.id);
 
     res.json({
       success: true,
@@ -4434,9 +5022,14 @@ export const deleteMultipleResponses = async (req, res) => {
 
     const result = await Response.deleteMany({ _id: { $in: allowedDbIds } });
 
-    // Invalidate server memory cache so subsequent requests return fresh results
-    suggestionsMemoryCache.clear();
-    invalidateCache('responses');
+    for (const doc of allowedDocs) {
+      const qId = String(doc.questionId || doc.formId || '');
+      if (qId) {
+        try {
+          emitResponseDeleted(qId, doc.id || String(doc._id));
+        } catch (e) { }
+      }
+    }
 
     res.json({
       success: true,
@@ -4455,7 +5048,7 @@ export const deleteMultipleResponses = async (req, res) => {
 export const getResponsesByForm = async (req, res) => {
   try {
     const { formId } = req.params;
-    const { page = 1, limit = 200, status, includePartial = 'false', dispatchedOnly = 'false' } = req.query;
+    const { page = 1, limit = 200, status, includePartial = 'false' } = req.query;
 
     console.log('[getResponsesByForm] Looking for form with ID:', formId);
     // Verify form exists - support either string id or mongo _id in a single lookup
@@ -4563,12 +5156,6 @@ export const getResponsesByForm = async (req, res) => {
       query.isSectionSubmit = { $ne: true };
     }
 
-    // Received a server-side dispatched-only filter? Apply isDispatched: true
-    // to the match. Existing tenant/shared/chassis scoping stays intact.
-    if (String(dispatchedOnly).toLowerCase() === 'true') {
-      query.isDispatched = true;
-    }
-
     // Add normalized date range filter if provided
     const { startDate, endDate } = req.query;
     if (startDate || endDate) {
@@ -4608,9 +5195,16 @@ export const getResponsesByForm = async (req, res) => {
           || form.followUpQuestions?.find(q => q.type === 'chassisNumber');
         const chassisFieldId = chassisQuestion?.id || 'chassis_number';
 
-        // Push the filter to mongo natively 
-        // e.g., answers.12345: { $in: ["CHAS1", "CHAS2"] }
-        query[`answers.${chassisFieldId}`] = { $in: myAssignedChassis };
+        const chassisConditions = [
+          { chassisNumber: { $in: myAssignedChassis } },
+          { 'answers.chassis_number': { $in: myAssignedChassis } },
+          { 'answers.chassisNumber': { $in: myAssignedChassis } }
+        ];
+        if (chassisFieldId && chassisFieldId !== 'chassis_number') {
+          chassisConditions.push({ [`answers.${chassisFieldId}`]: { $in: myAssignedChassis } });
+        }
+        if (!query.$and) query.$and = [];
+        query.$and.push({ $or: chassisConditions });
       } else {
         // They have chassis share access, but zero chassis assigned? Return empty.
         query._id = null; // Impossible query to force empty results
@@ -4654,12 +5248,12 @@ export const getResponsesByForm = async (req, res) => {
     let responsesQuery = Response.find(query);
     if (isAnalytics) {
       responsesQuery = responsesQuery.select(
-        '_id id questionId formId status answers submissionMetadata responseRanks chassisNumber batchId notes score parentResponseId submitterContact inviteId createdAt timestamp submittedBy createdBy isDispatched dispatchedAt dispatchedBy dispatchedByName biwReview submittedAt tenantId timeSpent totalTimeSpent startedAt completedAt'
+        '_id id questionId formId status answers submissionMetadata responseRanks chassisNumber batchId notes score parentResponseId submitterContact inviteId createdAt timestamp submittedBy createdBy isDispatched dispatchedAt dispatchedBy dispatchedByName biwReview submittedAt tenantId timeSpent totalTimeSpent startedAt completedAt review'
       );
     } else {
       responsesQuery = responsesQuery
         .select(
-          '_id id questionId formId status answers submissionMetadata responseRanks chassisNumber batchId notes score parentResponseId submitterContact inviteId createdAt timestamp submittedBy createdBy assignedTo verifiedBy isDispatched dispatchedAt dispatchedBy dispatchedByName biwReview submittedAt tenantId timeSpent totalTimeSpent startedAt completedAt'
+          '_id id questionId formId status answers submissionMetadata responseRanks chassisNumber batchId notes score parentResponseId submitterContact inviteId createdAt timestamp submittedBy createdBy assignedTo verifiedBy isDispatched dispatchedAt dispatchedBy dispatchedByName biwReview submittedAt tenantId timeSpent totalTimeSpent startedAt completedAt review'
         )
         .populate('assignedTo', 'username firstName lastName email')
         .populate('verifiedBy', 'username firstName lastName email')
@@ -4673,7 +5267,7 @@ export const getResponsesByForm = async (req, res) => {
       .maxTimeMS(30000)
       .lean();
 
-    const countPromise = Response.countDocuments(query).maxTimeMS(15000);
+    const countPromise = (isAnalytics && parseInt(page) > 1) ? Promise.resolve(0) : Response.countDocuments(query).maxTimeMS(15000);
 
     const [responsesRaw, total] = await Promise.all([responsesPromise, countPromise]);
     let responses = responsesRaw;
@@ -4681,6 +5275,27 @@ export const getResponsesByForm = async (req, res) => {
       responses = responsesRaw.map(r => {
         if (r.answers instanceof Map) {
           r.answers = Object.fromEntries(r.answers);
+        }
+        if (r.answers && typeof r.answers === 'object') {
+          // Keep lightweight answer data (status, values, remarks) while stripping heavy base64 images
+          const cleanAns = {};
+          for (const [k, v] of Object.entries(r.answers)) {
+            if (typeof v === 'string') {
+              if (v.startsWith('data:image') || v.length > 500) {
+                continue;
+              }
+              cleanAns[k] = v;
+            } else if (v && typeof v === 'object') {
+              const objCopy = { ...v };
+              if (typeof objCopy.evidenceUrl === 'string' && objCopy.evidenceUrl.startsWith('data:image')) {
+                objCopy.evidenceUrl = '';
+              }
+              cleanAns[k] = objCopy;
+            } else {
+              cleanAns[k] = v;
+            }
+          }
+          r.answers = cleanAns;
         }
         return r;
       });
@@ -4692,19 +5307,19 @@ export const getResponsesByForm = async (req, res) => {
     let reviewsByResponse = {};
     let messagesByResponse = {};
 
-    if (responses.length > 0) {
+    if (!isAnalytics && responses.length > 0) {
       const responseIds = responses.flatMap(r => [r.id, r._id ? r._id.toString() : null]).filter(Boolean);
       const [reviews, chatMessages] = await Promise.all([
         Review.find({ responseId: { $in: responseIds } })
-          .select('responseId reviewerName reviewerId reviewOption createdAt')
+          .select('responseId reviewerName reviewerId reviewOption remark reason flaggedQuestions createdAt')
           .populate('reviewerId', 'firstName lastName email username')
           .sort({ createdAt: -1 })
           .lean(),
         ChatMessage.find({
-          responseId: { $in: responseIds },
-          questionContexts: { $exists: true, $not: { $size: 0 } }
+          responseId: { $in: responseIds }
         })
-          .select('responseId questionContexts createdAt')
+          .select('responseId message status questionTitles questionContexts from toEmail createdAt')
+          .populate('from', 'firstName lastName email username')
           .sort({ createdAt: -1 })
           .lean(),
       ]);
@@ -4724,34 +5339,49 @@ export const getResponsesByForm = async (req, res) => {
       }, {});
     }
 
-    // Helper to safely extract chassis from any response document
-    const getChassisFromDoc = (doc) => {
-      const ans = doc.answers instanceof Map ? Object.fromEntries(doc.answers) : (doc.answers || {});
-      const val = extractAnswerString(
-        ans.chassis_number ||
-        ans.chassisNumber ||
-        ans.id_number ||
-        ans.idNumber ||
-        ans['ID number'] ||
-        ans['Chassis / VIN'] ||
-        ans['Chassis No'] ||
-        ans['CHASSIS NUMBER'] ||
-        doc.chassisNumber ||
-        (Object.keys(ans).length === 1 ? Object.values(ans)[0] : null)
-      );
-      return val ? String(val).trim() : null;
-    };
-
     // Calculate Parent <-> Child Form follow-up status for each chassis
-    const parentFormIdStr = form.parentFormId ? form.parentFormId.toString() : null;
-    const isChildForm = Boolean(parentFormIdStr);
+    let parentFormIdStr = form.parentFormId ? form.parentFormId.toString() : null;
+    let parentFormDoc = null;
+    if (parentFormIdStr) {
+      try {
+        const isObjId = mongoose.Types.ObjectId.isValid(parentFormIdStr);
+        parentFormDoc = await Form.findOne({
+          $or: [
+            { id: parentFormIdStr },
+            ...(isObjId ? [{ _id: new mongoose.Types.ObjectId(parentFormIdStr) }] : [])
+          ]
+        }).lean();
+      } catch (pDocErr) {
+        console.warn('[getResponsesByForm] Error finding parent form doc:', pDocErr);
+      }
+    } else {
+      try {
+        const formIdentifiers = [form.id, form._id ? form._id.toString() : null].filter(Boolean);
+        const objIds = formIdentifiers.filter(id => mongoose.Types.ObjectId.isValid(id)).map(id => new mongoose.Types.ObjectId(id));
+        const allIds = [...formIdentifiers, ...objIds];
+        parentFormDoc = await Form.findOne({
+          $or: [
+            { 'childForms.formId': { $in: allIds } },
+            { 'childForms.id': { $in: allIds } },
+            { 'childForms._id': { $in: objIds } },
+            { 'childForms.childFormId': { $in: allIds } }
+          ]
+        }).lean();
+        if (parentFormDoc) {
+          parentFormIdStr = parentFormDoc._id ? parentFormDoc._id.toString() : parentFormDoc.id;
+        }
+      } catch (pDocErr) {
+        console.warn('[getResponsesByForm] Error finding parent by childForms:', pDocErr);
+      }
+    }
+    const isChildForm = Boolean(parentFormIdStr || parentFormDoc);
 
     let childFormIds = (form.childForms || []).map(cf => cf.formId || cf.id || cf._id?.toString()).filter(Boolean);
     if (childFormIds.length === 0) {
       try {
         const potentialChildForms = await Form.find({
           parentFormId: { $in: [form.id, form._id ? form._id.toString() : null].filter(Boolean) }
-        }).select('id _id title').lean();
+        }).select('id _id title sections followUpQuestions').lean();
         if (potentialChildForms.length > 0) {
           childFormIds = potentialChildForms.map(cf => cf.id || (cf._id ? cf._id.toString() : null)).filter(Boolean);
         }
@@ -4760,6 +5390,90 @@ export const getResponsesByForm = async (req, res) => {
       }
     }
     const isParentForm = childFormIds.length > 0;
+
+    let childFormDocs = [];
+    if (childFormIds.length > 0) {
+      try {
+        const cIds = childFormIds.filter(Boolean);
+        const validObjIds = cIds.filter(id => mongoose.Types.ObjectId.isValid(id)).map(id => new mongoose.Types.ObjectId(id));
+        childFormDocs = await Form.find({
+          $or: [
+            { id: { $in: cIds } },
+            { _id: { $in: validObjIds } }
+          ]
+        }).lean();
+      } catch (cDocErr) {
+        console.warn('[getResponsesByForm] Error loading child form docs:', cDocErr);
+      }
+    }
+
+    // Helper to safely extract chassis from any response document
+    const getChassisFromDoc = (doc, targetForm = null) => {
+      if (!doc) return null;
+      const ans = doc.answers instanceof Map ? Object.fromEntries(doc.answers) : (doc.answers || {});
+
+      // 1. Any key ending with _tracking (e.g. "<questionId>_tracking") is highest priority
+      for (const [k, v] of Object.entries(ans)) {
+        if (k.endsWith('_tracking') && v !== undefined && v !== null) {
+          const str = extractAnswerString(v).trim();
+          if (str && str !== '-' && str !== 'N/A' && str !== 'None') {
+            return str;
+          }
+        }
+      }
+
+      // 2. Check questions from targetForm, form, parentFormDoc, or childFormDocs
+      const formsToCheck = [targetForm, form, parentFormDoc, ...childFormDocs].filter(Boolean);
+      for (const f of formsToCheck) {
+        const allFormQuestions = [];
+        (f.sections || []).forEach(s => (s.questions || []).forEach(q => allFormQuestions.push(q)));
+        (f.followUpQuestions || []).forEach(q => allFormQuestions.push(q));
+
+        const sorted = [...allFormQuestions].sort((a, b) => {
+          const aT = a.trackResponseRank || a.trackResponseQuestion || a.type === 'chassisNumber' ? 1 : 0;
+          const bT = b.trackResponseRank || b.trackResponseQuestion || b.type === 'chassisNumber' ? 1 : 0;
+          return bT - aT;
+        });
+
+        for (const q of sorted) {
+          const isCandidate = q.trackResponseRank || q.trackResponseQuestion || q.type === 'range' || q.type === 'chassisNumber' ||
+            (q.text && /(chassis|identification|vin|serial|vehicle|part\s*no|identif)/i.test(q.text));
+
+          if (isCandidate) {
+            const raw = ans[`${q.id}_tracking`] || ans[q.id] || ans[q.text];
+            const str = extractAnswerString(raw).trim();
+            if (str && str !== '-' && str !== 'N/A' && str !== 'None') {
+              return str;
+            }
+          }
+        }
+      }
+
+      // 3. Standard candidate keys in answers
+      const candidateKeys = [
+        'chassis_number', 'chassisNumber', 'id_number', 'idNumber',
+        'ID number', 'Identification Number', 'identification_number', 'identificationNumber',
+        'Identification no', 'Identification No', 'Chassis / VIN', 'Chassis No', 'CHASSIS NUMBER'
+      ];
+      for (const k of candidateKeys) {
+        if (ans[k] !== undefined && ans[k] !== null) {
+          const str = extractAnswerString(ans[k]).trim();
+          if (str && str !== '-' && str !== 'N/A' && str !== 'None') {
+            return str;
+          }
+        }
+      }
+
+      // 4. Fallback to doc.chassisNumber
+      if (doc.chassisNumber) {
+        const str = extractAnswerString(doc.chassisNumber).trim();
+        if (str && str !== '-' && str !== 'N/A' && str !== 'None') {
+          return str;
+        }
+      }
+
+      return null;
+    };
 
     const parentChassisMap = new Map();
     const parentByIdMap = new Map();
@@ -4770,10 +5484,20 @@ export const getResponsesByForm = async (req, res) => {
     );
 
     // Query parent/child matches if we have responses on this page and this form has parent/child relationships or follow-up responses
-    if (responses.length > 0 && (isChildForm || isParentForm || hasFollowUpResponsesInBatch)) {
+    // Skip for analytics queries because charts do not need table parent/child column linkage
+    if (!isAnalytics && responses.length > 0 && (isChildForm || isParentForm || hasFollowUpResponsesInBatch)) {
       const pageChassisList = responses.map(r => getChassisFromDoc(r)).filter(Boolean);
-      const pageChassisSet = new Set(pageChassisList.map(c => c.toLowerCase().trim()));
-      const chassisStrings = Array.from(pageChassisSet);
+      const chassisStringsSet = new Set();
+      pageChassisList.forEach(c => {
+        if (!c) return;
+        const trimmed = c.toString().trim();
+        if (trimmed) {
+          chassisStringsSet.add(trimmed);
+          chassisStringsSet.add(trimmed.toLowerCase());
+          chassisStringsSet.add(trimmed.toUpperCase());
+        }
+      });
+      const chassisStrings = Array.from(chassisStringsSet);
       const matchPromises = [];
 
       // 1. Direct parentResponseId lookup
@@ -4787,24 +5511,50 @@ export const getResponsesByForm = async (req, res) => {
               { _id: { $in: validObjectIds } }
             ]
           })
-            .select('answers createdAt id _id status submittedBy chassisNumber')
+            .select('answers createdAt id _id status submittedBy chassisNumber parentResponseId biwReview')
             .lean()
             .then(parentResponses => {
               parentResponses.forEach(pr => {
                 const prId = pr.id || (pr._id ? pr._id.toString() : null);
                 if (prId) parentByIdMap.set(prId, pr);
-                const pVal = getChassisFromDoc(pr);
+                const pVal = getChassisFromDoc(pr, parentFormDoc);
+                const prAns = pr.answers instanceof Map ? Object.fromEntries(pr.answers) : (pr.answers || {});
                 if (pVal) {
                   const norm = pVal.toLowerCase().trim();
+                  let realParentStatus = (pr.status && pr.status !== 'pending') ? pr.status : null;
+                  if (!realParentStatus && pr.biwReview?.status) {
+                    realParentStatus = pr.biwReview.status;
+                  }
+                  if (!realParentStatus && prAns) {
+                    let hasRework = false;
+                    let hasReject = false;
+                    for (const val of Object.values(prAns)) {
+                      if (val && typeof val === 'object' && val.status) {
+                        const s = String(val.status).toLowerCase().trim();
+                        if (s === 'rework' || s.includes('rework')) hasRework = true;
+                        if (s === 'rejected' || s === 'reject') hasReject = true;
+                      } else if (typeof val === 'string') {
+                        const s = val.toLowerCase().trim();
+                        if (s === 'rework' || s.includes('rework')) hasRework = true;
+                        if (s === 'rejected' || s === 'reject') hasReject = true;
+                      }
+                    }
+                    if (hasReject) realParentStatus = 'Rejected';
+                    else if (hasRework) realParentStatus = 'Rework 1';
+                    else realParentStatus = 'Direct Ok';
+                  }
+                  if (!realParentStatus) realParentStatus = 'Direct Ok';
+
                   if (!parentChassisMap.has(norm)) {
                     parentChassisMap.set(norm, {
                       hasResponse: true,
                       responseCount: 1,
                       latestCreatedAt: pr.createdAt,
-                      status: pr.status || 'Accepted',
+                      status: realParentStatus,
                       submittedBy: pr.submittedBy || 'Inspector',
                       responseId: prId,
-                      chassis: pVal
+                      chassis: pVal,
+                      answers: prAns
                     });
                   }
                 }
@@ -4849,46 +5599,122 @@ export const getResponsesByForm = async (req, res) => {
 
       // 3. Query parent responses by chassis
       if (chassisStrings.length > 0 && (isChildForm || isParentForm || hasFollowUpResponsesInBatch)) {
-        const parentFormIds = parentFormIdStr ? [parentFormIdStr] : [form.id, form._id ? form._id.toString() : null].filter(Boolean);
+        const parentFormIds = parentFormIdStr
+          ? [parentFormIdStr, parentFormDoc?.id, parentFormDoc?._id ? parentFormDoc._id.toString() : null].filter(Boolean)
+          : [form.id, form._id ? form._id.toString() : null].filter(Boolean);
+        const parentObjIds = parentFormIds.filter(id => mongoose.Types.ObjectId.isValid(id)).map(id => new mongoose.Types.ObjectId(id));
+
+        const parentSearchConditions = [];
+        const formsToExtractKeys = [parentFormDoc, form].filter(Boolean);
+        formsToExtractKeys.forEach(f => {
+          (f.sections || []).forEach(s => {
+            (s.questions || []).forEach(q => {
+              const isChassisQ = q.isTrackingNumber || q.isChassisQuestion || q.type === 'chassisNumber' ||
+                (q.title && /chassis|vin|frame|identification/i.test(q.title)) ||
+                (q.text && /chassis|vin|frame|identification/i.test(q.text)) ||
+                (q.label && /chassis|vin|frame|identification/i.test(q.label));
+              if (isChassisQ) {
+                if (q.id) {
+                  parentSearchConditions.push({ [`answers.${q.id}`]: { $in: chassisStrings } });
+                  parentSearchConditions.push({ [`answers.${q.id}_tracking`]: { $in: chassisStrings } });
+                }
+                if (q.text) {
+                  parentSearchConditions.push({ [`answers.${q.text}`]: { $in: chassisStrings } });
+                }
+              }
+            });
+          });
+        });
+
+        const standardParentKeys = [
+          'chassisNumber', 'answers.chassis_number', 'answers.chassisNumber',
+          'answers.id_number', 'answers.idNumber', 'answers.Identification Number',
+          'answers.identification_number', 'answers.identificationNumber',
+          'answers.Identification no', 'answers.Identification No',
+          'answers.ID number', 'answers.Chassis / VIN', 'answers.Chassis No', 'answers.CHASSIS NUMBER'
+        ];
+        standardParentKeys.forEach(k => {
+          parentSearchConditions.push({ [k]: { $in: chassisStrings } });
+        });
+
         const parentQuery = {
-          questionId: { $in: parentFormIds },
-          isSectionSubmit: { $ne: true },
           $or: [
-            { chassisNumber: { $in: chassisStrings } },
-            { 'answers.chassis_number': { $in: chassisStrings } },
-            { 'answers.chassisNumber': { $in: chassisStrings } },
-            { 'answers.id_number': { $in: chassisStrings } },
-            { 'answers.idNumber': { $in: chassisStrings } },
-            { 'answers.Chassis / VIN': { $in: chassisStrings } },
-            { 'answers.Chassis No': { $in: chassisStrings } },
-            { 'answers.CHASSIS NUMBER': { $in: chassisStrings } }
-          ]
+            { questionId: { $in: [...parentFormIds, ...parentObjIds] } },
+            { formId: { $in: [...parentFormIds, ...parentObjIds] } }
+          ],
+          isSectionSubmit: { $ne: true }
         };
+
+        if (chassisStrings.length > 0 && parentSearchConditions.length > 0) {
+          parentQuery.$and = [{ $or: parentSearchConditions }];
+        }
+
+
 
         matchPromises.push(
           Response.find(parentQuery)
-            .select('answers createdAt id _id status submittedBy chassisNumber')
+            .select('answers createdAt id _id status submittedBy chassisNumber parentResponseId biwReview review')
             .sort({ createdAt: -1 })
             .limit(5000)
             .lean()
             .then(parentResponses => {
+
               parentResponses.forEach(pr => {
-                const pVal = getChassisFromDoc(pr);
+                const prId = pr.id || (pr._id ? pr._id.toString() : null);
+                if (prId) parentByIdMap.set(prId, pr);
+                const pVal = getChassisFromDoc(pr, parentFormDoc);
+                const prAns = pr.answers instanceof Map ? Object.fromEntries(pr.answers) : (pr.answers || {});
                 if (pVal) {
                   const norm = pVal.toLowerCase().trim();
+                  let realParentStatus = (pr.status && pr.status !== 'pending') ? pr.status : null;
+                  if (!realParentStatus && pr.biwReview?.status) {
+                    realParentStatus = pr.biwReview.status;
+                  }
+                  if (!realParentStatus && prAns) {
+                    let hasRework = false;
+                    let hasReject = false;
+                    for (const val of Object.values(prAns)) {
+                      if (val && typeof val === 'object' && val.status) {
+                        const s = String(val.status).toLowerCase().trim();
+                        if (s === 'rework' || s.includes('rework')) hasRework = true;
+                        if (s === 'rejected' || s === 'reject') hasReject = true;
+                      } else if (typeof val === 'string') {
+                        const s = val.toLowerCase().trim();
+                        if (s === 'rework' || s.includes('rework')) hasRework = true;
+                        if (s === 'rejected' || s === 'reject') hasReject = true;
+                      }
+                    }
+                    if (hasReject) realParentStatus = 'Rejected';
+                    else if (hasRework) realParentStatus = 'Rework 1';
+                    else realParentStatus = 'Direct Ok';
+                  }
+                  if (!realParentStatus) realParentStatus = 'Direct Ok';
+
                   if (!parentChassisMap.has(norm)) {
                     parentChassisMap.set(norm, {
                       hasResponse: true,
                       responseCount: 1,
                       latestCreatedAt: pr.createdAt,
-                      status: pr.status || 'Accepted',
+                      status: realParentStatus,
                       submittedBy: pr.submittedBy || 'Inspector',
-                      responseId: pr.id || (pr._id ? pr._id.toString() : null),
-                      chassis: pVal
+                      responseId: prId,
+                      chassis: pVal,
+                      answers: prAns,
+                      review: pr.review,
+                      biwReview: pr.biwReview
                     });
                   } else {
                     const cur = parentChassisMap.get(norm);
                     cur.responseCount++;
+                    if (!cur.answers || Object.keys(cur.answers).length === 0) {
+                      cur.answers = prAns;
+                    }
+                    if (!cur.review && pr.review) {
+                      cur.review = pr.review;
+                    }
+                    if (!cur.biwReview && pr.biwReview) {
+                      cur.biwReview = pr.biwReview;
+                    }
                   }
                 }
               });
@@ -4899,30 +5725,64 @@ export const getResponsesByForm = async (req, res) => {
 
       // 4. Query child responses across child forms by chassis
       if (chassisStrings.length > 0 && childFormIds.length > 0) {
+        const childFormObjIds = childFormIds.filter(id => mongoose.Types.ObjectId.isValid(id)).map(id => new mongoose.Types.ObjectId(id));
+
+        const childSearchConditions = [];
+        childFormDocs.forEach(f => {
+          (f.sections || []).forEach(s => {
+            (s.questions || []).forEach(q => {
+              const isChassisQ = q.isTrackingNumber || q.isChassisQuestion || q.type === 'chassisNumber' ||
+                (q.title && /chassis|vin|frame|identification/i.test(q.title)) ||
+                (q.text && /chassis|vin|frame|identification/i.test(q.text)) ||
+                (q.label && /chassis|vin|frame|identification/i.test(q.label));
+              if (isChassisQ) {
+                if (q.id) {
+                  childSearchConditions.push({ [`answers.${q.id}`]: { $in: chassisStrings } });
+                  childSearchConditions.push({ [`answers.${q.id}_tracking`]: { $in: chassisStrings } });
+                }
+                if (q.text) {
+                  childSearchConditions.push({ [`answers.${q.text}`]: { $in: chassisStrings } });
+                }
+              }
+            });
+          });
+        });
+
+        const standardChildKeys = [
+          'chassisNumber', 'answers.chassis_number', 'answers.chassisNumber',
+          'answers.id_number', 'answers.idNumber', 'answers.Identification Number',
+          'answers.identification_number', 'answers.identificationNumber',
+          'answers.Identification no', 'answers.Identification No',
+          'answers.ID number', 'answers.Chassis / VIN', 'answers.Chassis No', 'answers.CHASSIS NUMBER'
+        ];
+        standardChildKeys.forEach(k => {
+          childSearchConditions.push({ [k]: { $in: chassisStrings } });
+        });
+
         const childQuery = {
-          questionId: { $in: childFormIds },
-          isSectionSubmit: { $ne: true },
           $or: [
-            { chassisNumber: { $in: chassisStrings } },
-            { 'answers.chassis_number': { $in: chassisStrings } },
-            { 'answers.chassisNumber': { $in: chassisStrings } },
-            { 'answers.id_number': { $in: chassisStrings } },
-            { 'answers.idNumber': { $in: chassisStrings } },
-            { 'answers.Chassis / VIN': { $in: chassisStrings } },
-            { 'answers.Chassis No': { $in: chassisStrings } },
-            { 'answers.CHASSIS NUMBER': { $in: chassisStrings } }
-          ]
+            { questionId: { $in: [...childFormIds, ...childFormObjIds] } },
+            { formId: { $in: [...childFormIds, ...childFormObjIds] } }
+          ],
+          isSectionSubmit: { $ne: true }
         };
+
+        if (chassisStrings.length > 0 && childSearchConditions.length > 0) {
+          childQuery.$and = [{ $or: childSearchConditions }];
+        }
 
         matchPromises.push(
           Response.find(childQuery)
-            .select('answers createdAt id _id status submittedBy chassisNumber')
+            .select('answers createdAt id _id status submittedBy chassisNumber parentResponseId biwReview review')
             .sort({ createdAt: -1 })
             .limit(5000)
             .lean()
             .then(childResponses => {
               childResponses.forEach(cr => {
                 const cVal = getChassisFromDoc(cr);
+                const crAns = cr.answers instanceof Map ? Object.fromEntries(cr.answers) : (cr.answers || {});
+                const crFormId = cr.questionId || cr.formId;
+                const matchedChildDoc = childFormDocs.find(cf => cf.id === crFormId || cf._id?.toString() === crFormId);
                 if (cVal) {
                   const norm = cVal.toLowerCase().trim();
                   if (!childChassisMap.has(norm)) {
@@ -4933,11 +5793,25 @@ export const getResponsesByForm = async (req, res) => {
                       status: cr.status || 'Direct Ok',
                       submittedBy: cr.submittedBy || 'Inspector',
                       responseId: cr.id || (cr._id ? cr._id.toString() : null),
-                      chassis: cVal
+                      chassis: cVal,
+                      answers: crAns,
+                      formTitle: matchedChildDoc?.title || 'Follow-up Form',
+                      formId: matchedChildDoc?.id || matchedChildDoc?._id?.toString() || crFormId,
+                      review: cr.review,
+                      biwReview: cr.biwReview
                     });
                   } else {
                     const cur = childChassisMap.get(norm);
                     cur.responseCount++;
+                    if (!cur.answers || Object.keys(cur.answers).length === 0) {
+                      cur.answers = crAns;
+                    }
+                    if (!cur.review && cr.review) {
+                      cur.review = cr.review;
+                    }
+                    if (!cur.biwReview && cr.biwReview) {
+                      cur.biwReview = cr.biwReview;
+                    }
                   }
                 }
               });
@@ -5009,9 +5883,10 @@ export const getResponsesByForm = async (req, res) => {
     // this keeps working if lean() is ever removed on this path.
     const formattedResponses = responses.map(response => {
       const responseObj = typeof response.toObject === 'function' ? response.toObject() : response;
-      const review = reviewsByResponse[response.id];
-      const message = messagesByResponse[response.id];
-
+      const respIdStr = response.id || (response._id ? response._id.toString() : '');
+      const respMongoId = response._id ? response._id.toString() : '';
+      const review = reviewsByResponse[respIdStr] || (respMongoId ? reviewsByResponse[respMongoId] : null);
+      const message = messagesByResponse[respIdStr] || (respMongoId ? messagesByResponse[respMongoId] : null);
       // Determine the best display name for submittedBy
       let displaySubmittedBy = response.submittedBy;
 
@@ -5034,11 +5909,50 @@ export const getResponsesByForm = async (req, res) => {
         displaySubmittedBy = response.submitterContact?.email || 'Anonymous';
       }
 
-      // Attach review info
-      const reviewInfo = review ? {
-        status: review.reviewOption,
-        reviewer: review.reviewerName || (review.reviewerId ? (review.reviewerId.firstName ? `${review.reviewerId.firstName} ${review.reviewerId.lastName}` : review.reviewerId.username) : 'Reviewer'),
-        flaggedQuestions: message ? message.questionContexts.map(c => c.title) : []
+      const existingReview = (response.review && typeof response.review === 'object') ? response.review : {};
+
+      let reviewerName = null;
+      if (review) {
+        if (review.reviewerName) {
+          reviewerName = review.reviewerName;
+        } else if (review.reviewerId) {
+          reviewerName = review.reviewerId.firstName
+            ? `${review.reviewerId.firstName} ${review.reviewerId.lastName || ''}`.trim()
+            : (review.reviewerId.username || review.reviewerId.email);
+        }
+      }
+      if (!reviewerName && existingReview.reviewerName) {
+        reviewerName = existingReview.reviewerName;
+      }
+      if (!reviewerName && message?.from) {
+        reviewerName = message.from.firstName
+          ? `${message.from.firstName} ${message.from.lastName || ''}`.trim()
+          : (message.from.username || message.from.email);
+      }
+
+      // TVS Review is exclusively for chat discussion / Quality reviews, completely separate from BIW review
+      const reviewStatus = review?.reviewOption || existingReview.reviewOption || existingReview.status || null;
+      const rawChatMsg = message?.message || existingReview.remark || existingReview.reason || null;
+      const isAutoBiwMsg = rawChatMsg && String(rawChatMsg).startsWith('[BIW Review]');
+      const chatMsg = isAutoBiwMsg ? null : rawChatMsg;
+      const chatStatus = isAutoBiwMsg ? null : (message?.status || (chatMsg ? 'sent' : null));
+
+      const flaggedQuestions = message?.questionContexts?.length > 0
+        ? message.questionContexts.map(c => c.title)
+        : (message?.questionTitles?.length > 0
+          ? message.questionTitles
+          : (existingReview.flaggedQuestions || []));
+
+      // Attach review info strictly when a legitimate review or message exists
+      const hasRealReview = Boolean(reviewStatus || chatMsg || (reviewerName && (existingReview.reviewedBy || existingReview.reviewerId)));
+      const reviewInfo = hasRealReview ? {
+        status: reviewStatus,
+        reviewer: reviewerName || 'Reviewer',
+        flaggedQuestions: reviewStatus ? flaggedQuestions : [],
+        message: chatMsg,
+        chatStatus: chatStatus,
+        messageCreatedAt: message?.createdAt || existingReview.createdAt || null,
+        messageFrom: reviewerName
       } : null;
 
       const toPlainObject = (val) => {
@@ -5064,10 +5978,15 @@ export const getResponsesByForm = async (req, res) => {
 
         if (isResponseFromChild) {
           // This is a follow-up response -> match up with parent responses!
+          const chassisMatch = norm ? parentChassisMap.get(norm) : null;
           const directParent = response.parentResponseId ? parentByIdMap.get(response.parentResponseId) : null;
-          const pMatch = directParent || (norm ? parentChassisMap.get(norm) : null);
+          // Prioritize matching by identical chassis number value across parent and child forms
+          const pMatch = chassisMatch || directParent;
+
           if (pMatch) {
-            const parentChassis = pMatch.chassis || getChassisFromDoc(pMatch) || chassisVal;
+            const parentChassis = pMatch.chassis || getChassisFromDoc(pMatch, parentFormDoc) || chassisVal;
+            const parentAnswers = pMatch.answers || (directParent ? (directParent.answers instanceof Map ? Object.fromEntries(directParent.answers) : (directParent.answers || {})) : {});
+            const finalParentStatus = (pMatch.status && pMatch.status !== 'pending') ? pMatch.status : 'Direct Ok';
             followUpStatus = {
               isMatched: true,
               matchType: 'parent',
@@ -5075,12 +5994,17 @@ export const getResponsesByForm = async (req, res) => {
               label: 'Parent Matched',
               badgeText: '✓ Parent Matched',
               color: 'emerald',
-              parentStatus: pMatch.status || 'Accepted',
+              parentStatus: finalParentStatus,
               parentSubmittedBy: pMatch.submittedBy || 'Inspector',
               parentCreatedAt: pMatch.createdAt || pMatch.latestCreatedAt,
-              parentResponseId: response.parentResponseId || pMatch.id || pMatch.responseId,
+              parentResponseId: pMatch.responseId ? String(pMatch.responseId) : (pMatch.id ? String(pMatch.id) : (pMatch._id ? String(pMatch._id) : (response.parentResponseId ? String(response.parentResponseId) : null))),
+              parentAnswers: parentAnswers,
+              parentFormTitle: parentFormDoc?.title || form.parentFormTitle,
+              parentFormId: parentFormDoc?.id || parentFormDoc?._id?.toString() || parentFormIdStr,
+              parentReview: pMatch.review || directParent?.review || null,
+              parentBiwReview: pMatch.biwReview || directParent?.biwReview || null,
               matchedChassis: parentChassis,
-              details: `Matched parent chassis "${parentChassis}" (Status: ${pMatch.status || 'Accepted'}) by ${pMatch.submittedBy || 'Inspector'}`
+              details: `Matched parent chassis "${parentChassis}" (Status: ${finalParentStatus}) by ${pMatch.submittedBy || 'Inspector'}`
             };
           } else {
             followUpStatus = {
@@ -5090,6 +6014,8 @@ export const getResponsesByForm = async (req, res) => {
               label: 'No Parent Match',
               badgeText: '⚠ No Parent Match',
               color: 'amber',
+              parentFormTitle: parentFormDoc?.title || form.parentFormTitle,
+              parentFormId: parentFormDoc?.id || parentFormDoc?._id?.toString() || parentFormIdStr,
               matchedChassis: chassisVal,
               details: `Chassis "${chassisVal}" has not been inspected in parent form yet`
             };
@@ -5110,6 +6036,11 @@ export const getResponsesByForm = async (req, res) => {
               followUpSubmittedBy: cMatch.submittedBy || 'Inspector',
               followUpCreatedAt: cMatch.latestCreatedAt || cMatch.createdAt,
               followUpResponseId: cMatch.responseId || cMatch.id,
+              childAnswers: cMatch.answers || {},
+              childFormTitle: cMatch.formTitle,
+              childFormId: cMatch.formId,
+              childReview: cMatch.review || null,
+              childBiwReview: cMatch.biwReview || null,
               matchedChassis: cMatch.chassis || chassisVal,
               details: `Follow-up completed for chassis "${cMatch.chassis || chassisVal}" by ${cMatch.submittedBy || 'Inspector'}`
             };
@@ -5169,8 +6100,26 @@ export const getResponsesByForm = async (req, res) => {
         };
       }
 
+      const formConfiguredChassis = (form.chassisNumbers || [])
+        .map(c => typeof c === 'string' ? c : (c.chassisNumber || c.name))
+        .filter(Boolean);
+
+      let resolvedChassis = getChassisFromDoc(response, form) || responseObj.chassisNumber || undefined;
+      if (formConfiguredChassis.length > 0 && !resolvedChassis) {
+        if (respAnswers.chassis_number && formConfiguredChassis.includes(respAnswers.chassis_number)) {
+          resolvedChassis = respAnswers.chassis_number;
+        } else if (responseObj.chassisNumber && formConfiguredChassis.includes(responseObj.chassisNumber)) {
+          resolvedChassis = responseObj.chassisNumber;
+        } else if (formConfiguredChassis.length === 1) {
+          resolvedChassis = formConfiguredChassis[0];
+        }
+      }
+      if (resolvedChassis && !respAnswers.chassis_number) {
+        respAnswers.chassis_number = resolvedChassis;
+      }
       return {
         ...responseObj,
+        chassisNumber: resolvedChassis,
         answers: respAnswers,
         responseRanks: toPlainObject(response.responseRanks),
         submissionMetadata: responseObj.submissionMetadata ? {
@@ -5180,7 +6129,18 @@ export const getResponsesByForm = async (req, res) => {
         submittedAt: responseObj.submittedAt || responseObj.createdAt || undefined,
         submittedBy: displaySubmittedBy, // Override with better display name
         review: reviewInfo,
-        followUpStatus
+        parentReview: responseObj.parentReview || followUpStatus?.parentReview || null,
+        childReview: responseObj.childReview || followUpStatus?.childReview || null,
+        parentAnswers: followUpStatus?.parentAnswers,
+        parentFormTitle: followUpStatus?.parentFormTitle || parentFormDoc?.title,
+        parentFormId: followUpStatus?.parentFormId || parentFormIdStr,
+        parentResponseId: followUpStatus?.parentResponseId,
+        childAnswers: followUpStatus?.childAnswers,
+        childFormTitle: followUpStatus?.childFormTitle,
+        childFormId: followUpStatus?.childFormId,
+        childResponseId: followUpStatus?.followUpResponseId,
+        followUpStatus,
+        parentMatch: followUpStatus
       };
     });
 
@@ -5194,7 +6154,14 @@ export const getResponsesByForm = async (req, res) => {
           isParentForm,
           isChildForm,
           childFormCount: childFormIds.length,
-          parentFormId: parentFormIdStr
+          parentFormId: parentFormIdStr,
+          parentFormTitle: parentFormDoc?.title || form.parentFormTitle,
+          parentForm: parentFormDoc ? {
+            id: parentFormDoc.id,
+            _id: parentFormDoc._id ? parentFormDoc._id.toString() : null,
+            title: parentFormDoc.title,
+            sections: parentFormDoc.sections || []
+          } : undefined
         },
         pagination: {
           currentPage: options.page,
@@ -5337,12 +6304,34 @@ export const exportResponses = async (req, res) => {
       }
     }
 
+    const formConfiguredChassis = (form.chassisNumbers || [])
+      .map(c => typeof c === 'string' ? c : (c.chassisNumber || c.name))
+      .filter(Boolean);
+
     // Convert Map to Object for JSON serialization
-    const formattedResponses = responses.map(response => ({
-      ...response.toObject(),
-      answers: response.answers ? Object.fromEntries(response.answers) : {},
-      responseRanks: response.responseRanks ? Object.fromEntries(response.responseRanks) : {}
-    }));
+    const formattedResponses = responses.map(response => {
+      const respObj = response.toObject();
+      const ansObj = response.answers ? (response.answers instanceof Map ? Object.fromEntries(response.answers) : response.answers) : {};
+      let resolvedChassis = respObj.chassisNumber || ansObj.chassis_number;
+      if (formConfiguredChassis.length > 0) {
+        if (ansObj.chassis_number && formConfiguredChassis.includes(ansObj.chassis_number)) {
+          resolvedChassis = ansObj.chassis_number;
+        } else if (respObj.chassisNumber && formConfiguredChassis.includes(respObj.chassisNumber)) {
+          resolvedChassis = respObj.chassisNumber;
+        } else if (formConfiguredChassis.length === 1) {
+          resolvedChassis = formConfiguredChassis[0];
+        }
+      }
+      if (resolvedChassis && !ansObj.chassis_number) {
+        ansObj.chassis_number = resolvedChassis;
+      }
+      return {
+        ...respObj,
+        chassisNumber: resolvedChassis,
+        answers: ansObj,
+        responseRanks: response.responseRanks ? (response.responseRanks instanceof Map ? Object.fromEntries(response.responseRanks) : response.responseRanks) : {}
+      };
+    });
 
     if (format === 'json') {
       const filename = `${form.title}_responses.json`;
@@ -5590,29 +6579,93 @@ export const bulkUpdateBiwReview = async (req, res) => {
       });
     }
 
-    const userEmail = req.user.email || '';
-    const userUsername = req.user.username || '';
+    const userEmail = (req.user.email || '').toLowerCase();
+    const userUsername = (req.user.username || '').toLowerCase();
     const userIdStr = req.user._id ? req.user._id.toString() : '';
-    const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
+    const isSuperAdmin = req.user.role === 'superadmin';
+    const userTenantIdStr = req.user.tenantId ? req.user.tenantId.toString() : '';
 
     let updatedCount = 0;
     let skippedCount = 0;
 
+    const Form = mongoose.model('Form');
+
     for (const response of responses) {
+      if (!isSuperAdmin) {
+        const formQueryOr = [];
+        if (response.formId) {
+          if (mongoose.Types.ObjectId.isValid(response.formId)) formQueryOr.push({ _id: response.formId });
+          formQueryOr.push({ id: response.formId });
+        }
+        if (response.questionId) {
+          if (mongoose.Types.ObjectId.isValid(response.questionId)) formQueryOr.push({ _id: response.questionId });
+          formQueryOr.push({ id: response.questionId });
+        }
+        const formObj = formQueryOr.length > 0 ? await Form.findOne({ $or: formQueryOr }).lean() : null;
+
+        let parentDoc = null;
+        if (formObj) {
+          const formIds = [formObj.id, formObj._id?.toString(), response.formId, response.questionId].filter(Boolean);
+          const parentQuery = [
+            { 'childForms.formId': { $in: formIds } },
+            { 'childForms.id': { $in: formIds } }
+          ];
+          const pId = formObj.parentFormId || formObj.parentForm?.id || formObj.parentForm?._id;
+          if (pId) {
+            if (mongoose.Types.ObjectId.isValid(pId)) parentQuery.push({ _id: pId });
+            parentQuery.push({ id: pId });
+          }
+          parentDoc = await Form.findOne({ $or: parentQuery }).lean();
+        }
+
+        const assignmentsToCheck = (formObj && Array.isArray(formObj.chassisTenantAssignments) && formObj.chassisTenantAssignments.length > 0)
+          ? formObj.chassisTenantAssignments
+          : (parentDoc?.chassisTenantAssignments || []);
+
+        if (assignmentsToCheck.length > 0) {
+          const respChassisCandidates = extractResponseChassisCandidates(response);
+
+          const assignment = assignmentsToCheck.find(a => {
+            const aChassis = String(a.chassisNumber || '').trim().toLowerCase();
+            return aChassis && respChassisCandidates.includes(aChassis);
+          });
+
+          if (assignment && Array.isArray(assignment.assignedTenants) && assignment.assignedTenants.length > 0) {
+            const isAssigned = assignment.assignedTenants.some(t => String(t?._id || t?.id || t) === userTenantIdStr);
+            const isFormOwner = (formObj?.tenantId && formObj.tenantId.toString() === userTenantIdStr) ||
+              (parentDoc?.tenantId && parentDoc.tenantId.toString() === userTenantIdStr);
+            const isSharedTenant = (Array.isArray(formObj?.sharedWithTenants) && formObj.sharedWithTenants.some(t => String(t?._id || t?.id || t) === userTenantIdStr)) ||
+              (Array.isArray(parentDoc?.sharedWithTenants) && parentDoc.sharedWithTenants.some(t => String(t?._id || t?.id || t) === userTenantIdStr));
+            const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
+
+            if (!isAssigned && !isFormOwner && !isSharedTenant && !isAdmin) {
+              skippedCount++;
+              continue;
+            }
+          }
+        }
+      }
+
       // Check if user is trying to review their own submission (mirror single review logic)
       const originalCreatedBy = response.createdBy;
       const originalSubmittedBy = response.submittedBy;
       const originalSubmitterContact = response.submitterContact;
       const creatorIdStr = originalCreatedBy ? originalCreatedBy.toString() : '';
       const isExcelImport = originalSubmittedBy === 'Excel Import';
+      const subBy = String(originalSubmittedBy || '').toLowerCase();
+      const crBy = String(originalCreatedBy || '').toLowerCase();
+      const contactEmail = String(originalSubmitterContact?.email || '').toLowerCase();
+      const isAdminOrSuperAdmin = req.user.role === 'superadmin' || req.user.role === 'admin';
 
       const isSubmitter =
-        !isAdmin &&
+        !isAdminOrSuperAdmin &&
         !isExcelImport &&
         (
-          originalSubmittedBy === userEmail ||
-          originalSubmittedBy === userUsername ||
-          (originalSubmitterContact && originalSubmitterContact.email === userEmail) ||
+          (userEmail && subBy === userEmail) ||
+          (userUsername && subBy === userUsername) ||
+          (userEmail && crBy === userEmail) ||
+          (userUsername && crBy === userUsername) ||
+          (userEmail && contactEmail === userEmail) ||
           (creatorIdStr && creatorIdStr === userIdStr)
         );
 
@@ -5633,7 +6686,19 @@ export const bulkUpdateBiwReview = async (req, res) => {
       }
 
       await response.save();
+      try {
+        const targetFormKey = String(response.formId || response.questionId || req.body?.formId || '');
+        if (targetFormKey) {
+          emitResponseUpdated(targetFormKey, response.toObject());
+        }
+      } catch (e) { }
       updatedCount++;
+    }
+
+    if (req.body?.formId) {
+      try {
+        emitBatchImported(String(req.body.formId), { formId: String(req.body.formId), type: 'bulk-biw-review' });
+      } catch (e) { }
     }
 
     // Record in history timeline
@@ -5674,5 +6739,594 @@ export const bulkUpdateBiwReview = async (req, res) => {
       success: false,
       message: 'Internal server error'
     });
+  }
+};
+
+export const bulkImportBiwExcelReviews = async (req, res) => {
+  try {
+    const { formId, reviews, fileName, targetFormId } = req.body;
+    const effectiveFormId = targetFormId || formId;
+
+    if (!effectiveFormId) {
+      return res.status(400).json({ success: false, message: 'formId is required' });
+    }
+
+    if (!Array.isArray(reviews) || reviews.length === 0) {
+      return res.status(400).json({ success: false, message: 'reviews array is required and cannot be empty' });
+    }
+
+    const form = await Form.findOne({
+      $or: [
+        { id: effectiveFormId },
+        ...(mongoose.Types.ObjectId.isValid(effectiveFormId) ? [{ _id: effectiveFormId }] : [])
+      ]
+    });
+
+    if (!form) {
+      return res.status(404).json({ success: false, message: 'Form not found' });
+    }
+
+    const formKey = form.id || form._id.toString();
+    const isAdmin = req.user?.role === 'admin' || req.user?.role === 'superadmin';
+    const reviewerName = req.user?.username || req.user?.name || req.user?.email || 'BIW Reviewer';
+    const reviewerEmail = req.user?.email || '';
+    const userIdStr = req.user?._id ? req.user._id.toString() : '';
+
+    // Determine Main Form and Child Form
+    let mainForm = null;
+    let childForm = null;
+    let mainFormId = null;
+    let childFormId = null;
+
+    if (form.parentFormId) {
+      // Current form IS a child form!
+      childForm = form;
+      childFormId = form._id.toString();
+      mainFormId = form.parentFormId;
+      mainForm = await Form.findOne({
+        $or: [
+          { id: mainFormId },
+          ...(mongoose.Types.ObjectId.isValid(mainFormId) ? [{ _id: mainFormId }] : [])
+        ]
+      });
+    } else {
+      // Current form IS a main/parent form!
+      mainForm = form;
+      mainFormId = form._id.toString();
+      const childForms = await Form.find({
+        $or: [
+          { parentFormId: formKey },
+          { parentFormId: form._id.toString() }
+        ]
+      }).select('_id id title').lean();
+      if (childForms.length > 0) {
+        childForm = childForms[0];
+        childFormId = childForm._id.toString();
+      }
+    }
+
+    const mainFormTitle = mainForm?.title || 'Main Form';
+    const childFormTitle = childForm?.title || 'Child Form';
+
+    // Helper to deeply extract chassis identifiers from a response
+    const extractChassisFromResp = (resp) => {
+      const chassisList = [resp.chassisNumber, resp.systemChassisNumber];
+      if (resp.answers) {
+        let answerObj = resp.answers;
+        if (typeof resp.answers.toJSON === 'function') {
+          answerObj = resp.answers.toJSON();
+        } else if (resp.answers instanceof Map) {
+          answerObj = Object.fromEntries(resp.answers);
+        }
+        if (answerObj && typeof answerObj === 'object') {
+          Object.entries(answerObj).forEach(([k, val]) => {
+            if (
+              (typeof val === 'string' || typeof val === 'number') &&
+              String(val).trim().length >= 1 &&
+              String(val).trim().length <= 60
+            ) {
+              chassisList.push(String(val).trim());
+            } else if (val && typeof val === 'object') {
+              if (val.chassisNumber) chassisList.push(String(val.chassisNumber).trim());
+              if (val.chassis) chassisList.push(String(val.chassis).trim());
+            }
+          });
+        }
+      }
+      return chassisList.filter(Boolean);
+    };
+
+    const indexResponsesByChassis = (respList) => {
+      const map = new Map();
+      for (const resp of respList) {
+        const list = extractChassisFromResp(resp);
+        for (const ch of list) {
+          if (!ch) continue;
+          const norm = String(ch).trim().toUpperCase();
+          if (!map.has(norm)) {
+            map.set(norm, []);
+          }
+          map.get(norm).push(resp);
+        }
+      }
+      return map;
+    };
+
+    // Preload candidate responses for Main Form
+    const mainFormIds = [mainFormId, mainForm?.id, mainForm?._id?.toString()].filter(Boolean);
+    const mainCandidateResponses = mainFormIds.length > 0 ? await Response.find({
+      $or: [
+        { questionId: { $in: mainFormIds } },
+        { formId: { $in: mainFormIds } },
+        ...(mongoose.Types.ObjectId.isValid(mainFormId) ? [{ formId: new mongoose.Types.ObjectId(mainFormId) }] : [])
+      ]
+    }) : [];
+
+    // Preload candidate responses for Child Form
+    const childFormIds = [childFormId, childForm?.id, childForm?._id?.toString()].filter(Boolean);
+    const childCandidateResponses = childFormIds.length > 0 ? await Response.find({
+      $or: [
+        { questionId: { $in: childFormIds } },
+        { formId: { $in: childFormIds } },
+        ...(mongoose.Types.ObjectId.isValid(childFormId) ? [{ formId: new mongoose.Types.ObjectId(childFormId) }] : [])
+      ]
+    }) : [];
+
+    const mainResponsesByChassis = indexResponsesByChassis(mainCandidateResponses);
+    const childResponsesByChassis = indexResponsesByChassis(childCandidateResponses);
+
+    let updatedCount = 0;
+    let skippedCount = 0;
+    let unmatchedCount = 0;
+    const errors = [];
+
+    for (let i = 0; i < reviews.length; i++) {
+      const row = reviews[i];
+      const rawChassis = String(
+        row.chassisNumber || row.chassisNo || row.che || row.cha || row['Chassis Number'] || row['chasis number'] || row['Che'] || row['cha'] || ''
+      ).trim();
+
+      if (!rawChassis) {
+        skippedCount++;
+        continue;
+      }
+
+      const normalizedChassis = rawChassis.toUpperCase();
+      const matchedMain = mainResponsesByChassis.get(normalizedChassis);
+      const matchedChild = childResponsesByChassis.get(normalizedChassis);
+
+      const mainResp = matchedMain ? matchedMain.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0] : null;
+      const childResp = matchedChild ? matchedChild.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0] : null;
+
+      if (!mainResp && !childResp) {
+        unmatchedCount++;
+        errors.push({ row: i + 1, chassis: rawChassis, error: 'Chassis number not found in main or child form' });
+        continue;
+      }
+
+      // Link parentResponseId if not already set
+      if (mainResp && childResp && !childResp.parentResponseId) {
+        childResp.parentResponseId = String(mainResp._id || mainResp.id);
+      }
+
+      // Anti-tamper check on target response
+      const activeResp = (form.parentFormId ? childResp : mainResp) || childResp || mainResp;
+      const originalSubmittedBy = activeResp?.submittedBy;
+      const isExcelImport = originalSubmittedBy === 'Excel Import';
+      const isSubmitter =
+        !isAdmin &&
+        !isExcelImport &&
+        (
+          originalSubmittedBy === reviewerEmail ||
+          originalSubmittedBy === reviewerName ||
+          (activeResp?.submitterContact && activeResp.submitterContact.email === reviewerEmail) ||
+          (activeResp?.createdBy && activeResp.createdBy.toString() === userIdStr)
+        );
+
+      if (isSubmitter) {
+        skippedCount++;
+        errors.push({ row: i + 1, chassis: rawChassis, error: 'Cannot review your own submission' });
+        continue;
+      }
+
+      let rowUpdated = false;
+
+      // 1. Process BIW Feedback (Applies to the form being reviewed)
+      const rawBiwFeedback = String(
+        row.biwFeedback || row['BIW Feed back'] || row['BIW Feedback'] || row['BIW Feed back(Accept,Rework,Reject)'] || ''
+      ).trim().toLowerCase();
+
+      let biwStatus = null;
+      if (rawBiwFeedback.includes('accept')) {
+        biwStatus = 'Accepted';
+      } else if (rawBiwFeedback.includes('rework')) {
+        biwStatus = 'Reworked';
+      } else if (rawBiwFeedback.includes('reject')) {
+        biwStatus = 'Rejected';
+      }
+
+      if (biwStatus && activeResp) {
+        const biwReason = String(
+          row.biwReason || row.reworkAndRejectedReason || row['Rework and Rejected Resion (Rust..)'] || row['Rework and Rejected Resion'] || ''
+        ).trim();
+        const biwRemark = String(row.biwRemark || row.remark || row['Remark'] || '').trim();
+        const biwFileUrl = String(row.biwFileUrl || row.fileUpload || row['File Upload'] || '').trim();
+
+        activeResp.biwReview = {
+          status: biwStatus,
+          reviewedBy: req.user._id,
+          reviewedByName: reviewerName,
+          reviewedAt: new Date(),
+          reason: biwReason,
+          remark: biwRemark,
+          evidenceUrl: biwFileUrl,
+          flaggedQuestions: biwReason ? [{ questionId: 'biw-excel', questionText: biwReason }] : []
+        };
+        activeResp.markModified('biwReview');
+        if (biwStatus === 'Rejected') {
+          activeResp.status = 'Rejected';
+        } else if (biwStatus === 'Reworked' && activeResp.status !== 'Rejected') {
+          activeResp.status = 'Rework 1';
+        }
+        rowUpdated = true;
+      }
+
+      // 2. Process TVS Feedback for 1st Form (Main Form: Cols F-J)
+      const rawTvsFeedback = String(
+        row.tvsFeedback || row['TVS Feed back'] || row['TVS Feedback'] || ''
+      ).trim().toLowerCase();
+
+      let tvsStatus = null;
+      if (rawTvsFeedback.includes('accept')) {
+        tvsStatus = 'Accepted';
+      } else if (rawTvsFeedback.includes('rework')) {
+        tvsStatus = 'Rework';
+      } else if (rawTvsFeedback.includes('reject')) {
+        tvsStatus = 'Rejected';
+      }
+
+      if (tvsStatus && mainResp) {
+        const tvsReason = String(
+          row.tvsReason || row.tvsReworkReason || row['Rework Resion (Rust..)'] || row['Rework and Rejected Resion (Rust..)'] || row['Rework and Rejected Reason'] || row.defectReason || ''
+        ).trim();
+        const tvsRejectReason = String(
+          row.tvsRejectReason || row['Rework and Rejected Resion (Rust..)_1'] || ''
+        ).trim();
+        const tvsRemark = String(row.tvsRemark || row.remark || row['Remark'] || row['Remark_1'] || row['Remark / Feedback Note'] || '').trim();
+        const tvsFileUrl = String(row.tvsFileUrl || row.fileUrl || row.fileUpload || row['File Upload'] || row['File Upload_1'] || '').trim();
+
+        const mainRespIdStr = String(mainResp._id || mainResp.id);
+        await Review.findOneAndUpdate(
+          { responseId: mainRespIdStr, reviewerId: req.user._id },
+          {
+            responseId: mainRespIdStr,
+            reviewerId: req.user._id,
+            reviewerName: reviewerName,
+            reviewerEmail: reviewerEmail,
+            submitterId: mainResp.submittedBy || mainResp.createdBy?.toString() || 'System',
+            reviewOption: tvsStatus,
+            status: tvsStatus,
+            reason: tvsReason || tvsRejectReason,
+            scoreChange: 0,
+            tenantId: mainResp.tenantId || req.user.tenantId
+          },
+          { upsert: true, new: true, setDefaultsOnInsert: true }
+        );
+
+        mainResp.review = {
+          reviewOption: tvsStatus,
+          status: tvsStatus,
+          reviewerId: req.user._id,
+          reviewerName: reviewerName,
+          createdAt: new Date(),
+          remark: tvsRemark,
+          reason: tvsReason || tvsRejectReason,
+          evidenceUrl: tvsFileUrl,
+          flaggedQuestions: (tvsReason || tvsRejectReason) ? [{
+            questionId: 'tvs-excel-main',
+            questionText: tvsReason || tvsRejectReason,
+            reason: tvsReason || tvsRejectReason
+          }] : []
+        };
+        mainResp.markModified('review');
+
+        if (tvsStatus === 'Rejected') {
+          mainResp.status = 'Rejected';
+        } else if (tvsStatus === 'Rework' && mainResp.status !== 'Rejected') {
+          mainResp.status = 'Rework 1';
+        }
+
+        // Insert ChatMessage for discussion center
+        try {
+          const toEmail = mainResp.submitterContact?.email || (typeof mainResp.submittedBy === 'string' && mainResp.submittedBy.includes('@') ? mainResp.submittedBy : 'inspector@factory.internal');
+          const chatText = tvsRemark || `TVS Review (1st: ${mainFormTitle}): ${tvsStatus}${tvsReason ? ` - ${tvsReason}` : ''}`;
+          await ChatMessage.create({
+            from: req.user._id,
+            toEmail: toEmail,
+            message: chatText,
+            responseId: mainRespIdStr,
+            formId: String(mainResp.formId || mainResp.questionId || mainFormId),
+            questionTitles: (tvsReason || tvsRejectReason) ? [tvsReason || tvsRejectReason] : [],
+            tenantId: mainResp.tenantId || req.user.tenantId
+          });
+        } catch (msgErr) {
+          console.warn('[BIW EXCEL IMPORT] ChatMessage creation failed for mainResp:', msgErr.message);
+        }
+
+        rowUpdated = true;
+      }
+
+      // 3. Process Target Tenant TVS Feedback (Child Form: Cols K-O)
+      const rawTargetTvsFeedback = String(
+        row.targetTvsFeedback || row['targetTvsFeedback'] || row['Target TVS Feedback'] || ''
+      ).trim().toLowerCase();
+
+      let targetTvsStatus = null;
+      if (rawTargetTvsFeedback.includes('accept')) {
+        targetTvsStatus = 'Accepted';
+      } else if (rawTargetTvsFeedback.includes('rework')) {
+        targetTvsStatus = 'Rework';
+      } else if (rawTargetTvsFeedback.includes('reject')) {
+        targetTvsStatus = 'Rejected';
+      }
+
+      if (targetTvsStatus && childResp) {
+        const targetTvsReason = String(row.targetTvsReason || row.targetTvsReworkReason || '').trim();
+        const targetTvsRejectReason = String(row.targetTvsRejectReason || '').trim();
+        const targetTvsRemark = String(row.targetTvsRemark || '').trim();
+        const targetTvsFileUrl = String(row.targetTvsFileUrl || '').trim();
+
+        const childRespIdStr = String(childResp._id || childResp.id);
+        await Review.findOneAndUpdate(
+          { responseId: childRespIdStr, reviewerId: req.user._id },
+          {
+            responseId: childRespIdStr,
+            reviewerId: req.user._id,
+            reviewerName: reviewerName,
+            reviewerEmail: reviewerEmail,
+            submitterId: childResp.submittedBy || childResp.createdBy?.toString() || 'System',
+            reviewOption: targetTvsStatus,
+            status: targetTvsStatus,
+            reason: targetTvsReason || targetTvsRejectReason,
+            scoreChange: 0,
+            tenantId: childResp.tenantId || req.user.tenantId
+          },
+          { upsert: true, new: true, setDefaultsOnInsert: true }
+        );
+
+        childResp.review = {
+          reviewOption: targetTvsStatus,
+          status: targetTvsStatus,
+          reviewerId: req.user._id,
+          reviewerName: reviewerName,
+          createdAt: new Date(),
+          remark: targetTvsRemark,
+          reason: targetTvsReason || targetTvsRejectReason,
+          evidenceUrl: targetTvsFileUrl,
+          flaggedQuestions: (targetTvsReason || targetTvsRejectReason) ? [{
+            questionId: 'target-tvs-excel',
+            questionText: targetTvsReason || targetTvsRejectReason,
+            reason: targetTvsReason || targetTvsRejectReason
+          }] : []
+        };
+        childResp.markModified('review');
+
+        if (targetTvsStatus === 'Rejected') {
+          childResp.status = 'Rejected';
+        } else if (targetTvsStatus === 'Rework' && childResp.status !== 'Rejected') {
+          childResp.status = 'Rework 1';
+        }
+
+        // Insert ChatMessage for discussion center
+        try {
+          const toEmail = childResp.submitterContact?.email || (typeof childResp.submittedBy === 'string' && childResp.submittedBy.includes('@') ? childResp.submittedBy : 'inspector@factory.internal');
+          const chatText = targetTvsRemark || `TVS Review (2nd: ${childFormTitle}): ${targetTvsStatus}${targetTvsReason ? ` - ${targetTvsReason}` : ''}`;
+          await ChatMessage.create({
+            from: req.user._id,
+            toEmail: toEmail,
+            message: chatText,
+            responseId: childRespIdStr,
+            formId: String(childResp.formId || childResp.questionId || childFormId),
+            questionTitles: (targetTvsReason || targetTvsRejectReason) ? [targetTvsReason || targetTvsRejectReason] : [],
+            tenantId: childResp.tenantId || req.user.tenantId
+          });
+        } catch (msgErr) {
+          console.warn('[BIW EXCEL IMPORT] ChatMessage creation failed for childResp:', msgErr.message);
+        }
+
+        rowUpdated = true;
+      }
+
+      // Cross-link reviews between mainResp and childResp
+      if (mainResp && childResp) {
+        if (mainResp.review) {
+          childResp.parentReview = mainResp.review;
+          childResp.markModified('parentReview');
+        }
+        if (childResp.review) {
+          mainResp.childReview = childResp.review;
+          mainResp.markModified('childReview');
+        }
+      }
+
+      if (rowUpdated) {
+        if (mainResp && mainResp.isModified()) {
+          await mainResp.save();
+          try {
+            emitResponseUpdated(String(mainResp.formId || mainResp.questionId || mainFormId), mainResp);
+          } catch (sockErr) { }
+        }
+        if (childResp && childResp.isModified()) {
+          await childResp.save();
+          try {
+            emitResponseUpdated(String(childResp.formId || childResp.questionId || childFormId), childResp);
+          } catch (sockErr) { }
+        }
+        updatedCount++;
+      } else {
+        skippedCount++;
+      }
+    }
+
+    // Record in history log
+    const isTvsImport = reviews.some(r => r.tvsFeedback || r['TVS Feed back'] || r['TVS Feedback']);
+    const reviewActionType = isTvsImport ? 'EXCEL_TVS_REVIEW_IMPORT' : 'EXCEL_BIW_REVIEW_IMPORT';
+    const reviewActionTitle = isTvsImport ? 'TVS Review Excel Import' : 'BIW Review Excel Import';
+
+    recordImportHistory({
+      tenantId: req.user?.tenantId,
+      userId: req.user?._id,
+      userName: reviewerName,
+      userEmail: reviewerEmail,
+      userRole: req.user?.role || 'admin',
+      actionType: reviewActionType,
+      actionTitle: reviewActionTitle,
+      formId: formKey,
+      formTitle: form.title || (isTvsImport ? 'TVS Review' : 'BIW Review'),
+      fileName: fileName || (isTvsImport ? 'TVS_Review_Import.xlsx' : 'BIW_Review_Import.xlsx'),
+      batchId: `${isTvsImport ? 'tvs' : 'biw'}-review-${Date.now()}`,
+      dataCount: {
+        total: reviews.length,
+        success: updatedCount,
+        failed: unmatchedCount + skippedCount
+      },
+      details: {
+        notes: `Excel Review Import: ${updatedCount} updated, ${unmatchedCount} unmatched, ${skippedCount} skipped.`,
+        sampleChassis: reviews.slice(0, 5).map(r => r.chassisNumber || r.chassisNo || r.che).filter(Boolean)
+      },
+      status: updatedCount > 0 ? 'success' : 'failed'
+    }).catch(err => console.error('[IMPORT HISTORY LOG ERROR]', err));
+
+    return res.json({
+      success: true,
+      message: `BIW Review Excel Import completed: ${updatedCount} updated, ${unmatchedCount} unmatched, ${skippedCount} skipped.`,
+      data: {
+        total: reviews.length,
+        updatedCount,
+        unmatchedCount,
+        skippedCount,
+        errors: errors.slice(0, 20)
+      }
+    });
+
+  } catch (error) {
+    console.error('Bulk Import BIW Excel Reviews Error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to import BIW Excel reviews',
+      error: error.message
+    });
+  }
+};
+// ═════════════════════════════════════════════════════════════════════════════
+// batchSyncResponses
+// ═════════════════════════════════════════════════════════════════════════════
+export const batchSyncResponses = async (req, res) => {
+  try {
+    const { responses } = req.body;
+    if (!Array.isArray(responses) || responses.length === 0) {
+      return res.status(400).json({ success: false, message: 'responses array is required' });
+    }
+
+    const results = [];
+    for (const item of responses) {
+      const { idempotencyKey, formId, chassisNumber, answers, clientProvisionalRank, submittedAt, submittedBy } = item;
+
+      let existing = null;
+      if (idempotencyKey) {
+        existing = await Response.findOne({
+          $or: [
+            { 'submissionMetadata.idempotencyKey': idempotencyKey },
+            { 'submissionMetadata.sessionId': idempotencyKey },
+            { sessionId: idempotencyKey },
+          ],
+        }).lean();
+      }
+
+      const chassis = chassisNumber || answers?.chassis_number || answers?.chassisNumber || 'UNKNOWN';
+
+      let form = await Form.findOne({ id: formId });
+      if (!form && mongoose.Types.ObjectId.isValid(formId)) form = await Form.findById(formId);
+      if (!form) {
+        results.push({
+          idempotencyKey: idempotencyKey || null,
+          serverId: null,
+          assignedRank: null,
+          success: false,
+          error: `Form not found: ${formId}`,
+        });
+        continue;
+      }
+
+      const formIds = getThisFormIds(form, formId);
+      const priorCount = await Response.countDocuments({
+        $and: [
+          { $or: [{ questionId: { $in: formIds } }, { formId: { $in: formIds } }] },
+          {
+            $or: [
+              { chassisNumber: chassis },
+              { 'answers.chassis_number': chassis },
+              { 'answers.chassisNumber': chassis },
+            ],
+          },
+        ],
+      });
+
+      if (existing) {
+        results.push({
+          idempotencyKey: idempotencyKey || existing._id.toString(),
+          serverId: existing._id.toString(),
+          assignedRank: existing.rank || (priorCount > 0 ? priorCount : 1),
+          success: true,
+        });
+        continue;
+      }
+
+      const assignedRank = priorCount + 1;
+      let subStatus = 'Direct Ok';
+      if (answers && typeof answers === 'object') {
+        const statuses = Object.values(answers)
+          .map((v) => (typeof v === 'object' && v ? v.status : v))
+          .map((v) => String(v || '').toLowerCase());
+        if (statuses.some((s) => s.includes('reject'))) subStatus = 'Rejected';
+        else if (statuses.some((s) => s.includes('rework'))) subStatus = 'Rework';
+      }
+
+      const newResponse = new Response({
+        id: uuidv4(),
+        tenantId: form.tenantId,
+        questionId: formId,
+        formId,
+        chassisNumber: chassis,
+        rank: assignedRank,
+        answers: answers || {},
+        submittedBy: submittedBy || req.user?.username || 'Subadmin',            // ← changed
+        submittedByName: submittedBy || req.user?.displayName || req.user?.username || 'Subadmin',  // ← changed
+        status: subStatus === 'Direct Ok' ? 'pending' : subStatus.toLowerCase(),
+        subStatus,
+        sessionId: idempotencyKey,
+        submissionMetadata: {
+          source: 'mobile-batch-sync',
+          idempotencyKey,
+          clientProvisionalRank,
+        },
+        createdAt: submittedAt ? new Date(submittedAt) : new Date(),
+      });
+
+      await newResponse.save();
+
+      results.push({
+        idempotencyKey: idempotencyKey || newResponse._id.toString(),
+        serverId: newResponse._id.toString(),
+        assignedRank,
+        success: true,
+      });
+    }
+
+    clearRankCache();
+    return res.status(200).json({ success: true, data: { results } });
+  } catch (error) {
+    console.error('[BATCH-SYNC] Error processing batch sync:', error);
+    return res.status(500).json({ success: false, message: 'Failed to process batch sync' });
   }
 };

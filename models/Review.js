@@ -36,6 +36,18 @@ const reviewSchema = new mongoose.Schema({
     enum: ['Accepted', 'Rejected', 'Rework'],
     required: true
   },
+  remark: {
+    type: String,
+    default: ''
+  },
+  reason: {
+    type: String,
+    default: ''
+  },
+  flaggedQuestions: [{
+    questionId: String,
+    questionText: String
+  }],
   scoreChange: {
     type: Number,
     required: true
@@ -74,5 +86,14 @@ reviewSchema.pre('save', function (next) {
   next();
 });
 
-const Review = mongoose.model('Reviews', reviewSchema);
+let Review;
+try {
+  Review = mongoose.model('Reviews');
+} catch {
+  Review = mongoose.model('Reviews', reviewSchema);
+}
+try {
+  mongoose.model('Review', reviewSchema);
+} catch {}
+
 export default Review;

@@ -2,6 +2,7 @@ import mongoose from 'mongoose';
 import ChatMessage from '../models/ChatMessage.js';
 import User from '../models/User.js';
 import Response from '../models/Response.js';
+import Form from '../models/Form.js';
 
 /**
  * Send a message to a submitter (inspector)
@@ -10,6 +11,58 @@ export const sendMessage = async (req, res) => {
   try {
     const { toEmail, message, responseId, formId, questionIds, questionTitles, questionContexts, tenantId } = req.body;
     
+    // Validation: If chassis has assigned tenants, chat must arise from assigned tenant, form owner, or admin.
+    // Other tenants can only reply once a message or review feedback has arisen.
+    if (responseId && req.user.role !== 'superadmin') {
+      const isRespObjId = mongoose.Types.ObjectId.isValid(responseId);
+      const resp = await Response.findOne({
+        $or: [
+          { id: responseId },
+          ...(isRespObjId ? [{ _id: new mongoose.Types.ObjectId(responseId) }] : [])
+        ]
+      });
+      if (resp) {
+        const targetFormId = resp.formId || resp.questionId || formId;
+        const isFormObjId = targetFormId && mongoose.Types.ObjectId.isValid(targetFormId);
+        const form = targetFormId
+          ? await Form.findOne({
+              $or: [
+                { id: targetFormId },
+                ...(isFormObjId ? [{ _id: new mongoose.Types.ObjectId(targetFormId) }] : [])
+              ]
+            })
+          : null;
+        if (form && Array.isArray(form.chassisTenantAssignments) && form.chassisTenantAssignments.length > 0) {
+          const respChassis = String(
+            resp.chassisNumber ||
+            (resp.answers instanceof Map ? resp.answers.get('chassis_number') || resp.answers.get('chassisNumber') : resp.answers?.chassis_number || resp.answers?.chassisNumber) ||
+            ''
+          ).trim().toLowerCase();
+          const assignment = form.chassisTenantAssignments.find(
+            a => a.chassisNumber && respChassis && String(a.chassisNumber).trim().toLowerCase() === respChassis
+          );
+          if (assignment && Array.isArray(assignment.assignedTenants) && assignment.assignedTenants.length > 0) {
+            const userTenantStr = req.user.tenantId ? req.user.tenantId.toString() : '';
+            const isAssignedTenant = assignment.assignedTenants.some(t => t.toString() === userTenantStr);
+            const isFormOwner = (form.tenantId && form.tenantId.toString() === userTenantStr);
+            const isSharedTenant = Array.isArray(form.sharedWithTenants) && form.sharedWithTenants.some(t => String(t?._id || t?.id || t) === userTenantStr);
+            const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
+
+            if (!isAssignedTenant && !isFormOwner && !isSharedTenant && !isAdmin) {
+              const existingMsgCount = await ChatMessage.countDocuments({ responseId });
+              const hasReviewArisen = Boolean(resp.biwReview?.status || resp.review?.status || resp.review?.message);
+              if (existingMsgCount === 0 && !hasReviewArisen) {
+                return res.status(403).json({
+                  success: false,
+                  message: 'Chat must be initiated by the assigned tenant reviewer. You can reply once a discussion or review feedback has been posted.'
+                });
+              }
+            }
+          }
+        }
+      }
+    }
+
     // Check if toEmail is actually a valid ObjectId (meaning frontend sent user ID)
     let receiver = null;
     let finalToEmail = toEmail;
@@ -52,17 +105,114 @@ export const sendMessage = async (req, res) => {
 export const getMessagesByResponse = async (req, res) => {
   try {
     const { responseId } = req.params;
-    const tenantId = req.user.tenantId;
     
     console.log("[getMessagesByResponse] responseId:", responseId);
-    console.log("[getMessagesByResponse] tenantId:", tenantId);
     
-    const messages = await ChatMessage.find({ 
-      responseId
+    // Support matching by string UUID id, ObjectId _id, or mapped parent/child response
+    const allResponseIds = [responseId];
+    let mainResp = null;
+    let pairedResp = null;
+
+    try {
+      mainResp = mongoose.Types.ObjectId.isValid(responseId)
+        ? await Response.findById(responseId).lean()
+        : await Response.findOne({ id: responseId }).lean();
+
+      if (mainResp) {
+        if (mainResp.id) allResponseIds.push(String(mainResp.id));
+        if (mainResp._id) allResponseIds.push(String(mainResp._id));
+
+        // If this response is a child pointing to a parent
+        if (mainResp.parentResponseId) {
+          allResponseIds.push(String(mainResp.parentResponseId));
+          pairedResp = mongoose.Types.ObjectId.isValid(mainResp.parentResponseId)
+            ? await Response.findById(mainResp.parentResponseId).lean()
+            : await Response.findOne({ id: mainResp.parentResponseId }).lean();
+        }
+
+        // If this response is a parent having child responses
+        if (!pairedResp) {
+          pairedResp = await Response.findOne({
+            parentResponseId: { $in: [String(mainResp._id), String(mainResp.id)].filter(Boolean) }
+          }).lean();
+        }
+
+        if (pairedResp) {
+          if (pairedResp.id) allResponseIds.push(String(pairedResp.id));
+          if (pairedResp._id) allResponseIds.push(String(pairedResp._id));
+        }
+      }
+    } catch (e) {
+      console.warn('[getMessagesByResponse] Error resolving paired response:', e.message);
+    }
+
+    const uniqueIds = [...new Set(allResponseIds.filter(Boolean))];
+
+    let messages = await ChatMessage.find({ 
+      responseId: { $in: uniqueIds }
     })
-      .populate('from', 'name email username')
-      .populate('toUser', 'name email username')
-      .sort({ createdAt: 1 });
+      .populate('from', 'name email username firstName lastName')
+      .populate('toUser', 'name email username firstName lastName')
+      .sort({ createdAt: 1 })
+      .lean();
+
+    // If no chat messages found, synthesize opening review messages for both responses if available
+    if (messages.length === 0 && (mainResp || pairedResp)) {
+      try {
+        const synthFromReview = async (r, labelPrefix) => {
+          const curRev = r?.review;
+          const revMsg = curRev?.remark || curRev?.reason || curRev?.message;
+          if (!curRev || !revMsg) return null;
+
+          const reviewerId = curRev.reviewedBy;
+          let reviewerDoc = null;
+          if (reviewerId && mongoose.Types.ObjectId.isValid(reviewerId)) {
+            reviewerDoc = await User.findById(reviewerId).select('firstName lastName username email').lean();
+          }
+          const reviewerName = reviewerDoc
+            ? `${reviewerDoc.firstName || ''} ${reviewerDoc.lastName || ''}`.trim() || reviewerDoc.username || reviewerDoc.email
+            : (curRev.reviewedByName || curRev.reviewer || 'Reviewer');
+
+          return {
+            _id: 'rev-auto-init-' + String(r._id || r.id),
+            responseId: String(r.id || r._id),
+            from: {
+              _id: reviewerId,
+              name: reviewerName,
+              email: reviewerDoc?.email || ''
+            },
+            message: `${labelPrefix ? `[${labelPrefix}] ` : ''}${revMsg}`,
+            questionTitles: Array.isArray(curRev.flaggedQuestions)
+              ? curRev.flaggedQuestions.map(q => typeof q === 'object' ? q.questionText || q.title || q.text || q.questionId : String(q))
+              : [],
+            questionContexts: Array.isArray(curRev.flaggedQuestions)
+              ? curRev.flaggedQuestions.map(q => ({
+                  questionId: typeof q === 'object' ? q.questionId || q.id : String(q),
+                  title: typeof q === 'object' ? q.questionText || q.title || q.text : String(q)
+                }))
+              : [],
+            createdAt: curRev.reviewedAt || r.updatedAt || new Date(),
+            isReviewFeedback: true,
+            reviewOption: curRev.reviewOption || curRev.status
+          };
+        };
+
+        const synthMessages = [];
+        if (pairedResp) {
+          const m = await synthFromReview(pairedResp, '1st Form');
+          if (m) synthMessages.push(m);
+        }
+        if (mainResp) {
+          const m = await synthFromReview(mainResp, pairedResp ? '2nd Form' : '');
+          if (m) synthMessages.push(m);
+        }
+        if (synthMessages.length > 0) {
+          messages = synthMessages;
+        }
+      } catch (synthErr) {
+        console.warn('[getMessagesByResponse] Synthesizing review messages failed:', synthErr.message);
+      }
+    }
 
     console.log("[getMessagesByResponse] Found messages:", messages.length);
     res.json({ success: true, data: messages });

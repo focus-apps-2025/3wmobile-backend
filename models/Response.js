@@ -41,7 +41,6 @@ const ResponseSchema = new mongoose.Schema({
   verifiedAt: Date,
   status: {
     type: String,
-    enum: ['pending', 'verified', 'rejected'],
     default: 'pending'
   },
   createdBy: {
@@ -202,7 +201,7 @@ const ResponseSchema = new mongoose.Schema({
   biwReview: {
     status: {
       type: String,
-      enum: ['Accepted', 'Rejected', 'Reworked']
+      enum: ['Accepted', 'Rejected', 'Reworked', 'accepted', 'rejected', 'reworked']
     },
     reviewedBy: {
       type: mongoose.Schema.Types.ObjectId,
@@ -217,6 +216,15 @@ const ResponseSchema = new mongoose.Schema({
       questionId: String,
       questionText: String
     }]
+  },
+  review: {
+    type: mongoose.Schema.Types.Mixed
+  },
+  parentReview: {
+    type: mongoose.Schema.Types.Mixed
+  },
+  childReview: {
+    type: mongoose.Schema.Types.Mixed
   }
 }, {
   timestamps: true,
@@ -252,9 +260,13 @@ ResponseSchema.index({ 'biwReview.status': 1 }); // NEW - for BIW review table q
 // ========== NEW - PERFORMANCE TABLE PAGINATION INDEXES ==========
 // Support skip()/limit() + sort({createdAt:-1}) pagination scoped by form
 // or by tenant, without a full collection scan.
-ResponseSchema.index({ questionId: 1, createdAt: -1 });
 ResponseSchema.index({ questionId: 1, isSectionSubmit: 1, createdAt: -1 });
-ResponseSchema.index({ tenantId: 1, createdAt: -1 });
+ResponseSchema.index({ questionId: 1, 'biwReview.status': 1 });
+
+// High-performance chassis tracking & rank lookups
+ResponseSchema.index({ chassisNumber: 1, questionId: 1, isSectionSubmit: 1 });
+ResponseSchema.index({ chassisNumber: 1, formId: 1, isSectionSubmit: 1 });
+ResponseSchema.index({ chassisNumber: 1, isSectionSubmit: 1 });
 ResponseSchema.index({ tenantId: 1, isSectionSubmit: 1, createdAt: -1 }); // NEW - to fix responses?limit=1000 timeouts
 ResponseSchema.index({ createdBy: 1, createdAt: -1, tenantId: 1 });
 ResponseSchema.index({ chassisNumber: 1 });
@@ -323,9 +335,6 @@ ResponseSchema.index({ tenantId: 1, createdAt: -1 });
 
 // Form-specific queries: filter by questionId (formId), sort by createdAt desc
 ResponseSchema.index({ questionId: 1, createdAt: -1 });
-ResponseSchema.index({ questionId: 1, createdAt: 1 });
-ResponseSchema.index({ formId: 1, createdAt: -1 });
-ResponseSchema.index({ formId: 1, createdAt: 1 });
 
 // Inspector queries: filter by createdBy + questionId
 ResponseSchema.index({ createdBy: 1, questionId: 1, createdAt: -1 });

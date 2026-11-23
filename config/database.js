@@ -37,13 +37,13 @@ const connectDB = async () => {
     const isServerless = !!process.env.VERCEL || !!process.env.AWS_LAMBDA_FUNCTION_NAME;
     const isReplicaSet = process.env.MONGODB_URI.includes('mongodb+srv') || process.env.MONGODB_URI.includes('replicaSet');
     const opts = {
-      maxPoolSize: isServerless ? 2 : 20,
-      minPoolSize: 0,
-      maxIdleTimeMS: 10000,
-      serverSelectionTimeoutMS: 15000,
-      socketTimeoutMS: 45000,
-      connectTimeoutMS: 15000,
-      heartbeatFrequencyMS: 15000,
+      maxPoolSize: isServerless ? 2 : 100,
+      minPoolSize: isServerless ? 0 : 5,
+      maxIdleTimeMS: 45000,
+      serverSelectionTimeoutMS: 60000,
+      socketTimeoutMS: 120000,
+      connectTimeoutMS: 45000,
+      heartbeatFrequencyMS: 30000,
       ...(isReplicaSet ? { retryWrites: true, w: 'majority' } : { retryWrites: false })
     };
 

@@ -5,6 +5,8 @@ import Parameter from '../models/Parameter.js';
 import Tenant from '../models/Tenant.js';
 import User from '../models/User.js';
 import { v4 as uuidv4 } from 'uuid';
+import { clearFormCache } from '../utils/cache.js';
+import { emitFormsChanged } from '../socket/socketHandler.js';
 
 const ALLOWED_FILE_TYPES = ['image', 'pdf', 'excel', 'stp', 'pvz', 'doc', 'docx'];
 
@@ -295,8 +297,14 @@ export const createForm = async (req, res) => {
 
     await form.save();
 
-    // If parentFormId is specified, auto-link to parent's childForms
+    // If parentFormId is specified, ensure child form has parentFormId & parentFormTitle and auto-link to parent's childForms
     if (formData.parentFormId) {
+      form.parentFormId = formData.parentFormId.toString();
+      if (formData.parentFormTitle) {
+        form.parentFormTitle = formData.parentFormTitle;
+      }
+      await form.save();
+
       try {
         const parentForm = await Form.findOne({
           $or: [
@@ -306,13 +314,16 @@ export const createForm = async (req, res) => {
         });
         if (parentForm) {
           if (!parentForm.childForms) parentForm.childForms = [];
-          const exists = parentForm.childForms.some(cf => cf.formId === form.id || cf.formId === form._id.toString());
+          const formMongoId = form._id ? form._id.toString() : '';
+          const formUuid = form.id ? String(form.id) : '';
+          const exists = parentForm.childForms.some(cf => (formUuid && cf.formId === formUuid) || (formMongoId && cf.formId === formMongoId));
           if (!exists) {
             parentForm.childForms.push({
-              formId: form.id || form._id.toString(),
+              formId: formMongoId || formUuid,
               formTitle: form.title,
               order: parentForm.childForms.length
             });
+            parentForm.markModified('childForms');
             await parentForm.save();
           }
         }
@@ -321,8 +332,10 @@ export const createForm = async (req, res) => {
       }
     }
 
-    console.log('Form created successfully with ID:', form.id);
+    clearFormCache();
+    emitFormsChanged({ action: 'created', formId: form._id ? form._id.toString() : form.id, tenantId: form.tenantId });
 
+    console.log('Form created successfully with ID:', form.id);
 
     res.status(201).json({
       success: true,
@@ -372,23 +385,58 @@ export const createForm = async (req, res) => {
 
 export const getAllForms = async (req, res) => {
   try {
-    const { page = 1, limit = 1000, search, isVisible, isActive, createdBy, isGlobal, tenantId: queryTenantId } = req.query;
+    const { page = 1, limit = 1000, search, isVisible, isActive, createdBy, isGlobal, tenantId: queryTenantId, allTenants } = req.query;
 
-    let query = { ...req.tenantFilter };
+    // If allTenants is requested by admin/subadmin, bypass tenant restriction to allow cross-tenant form discovery
+    const allowCrossTenantDiscovery = allTenants === 'true' && ['admin', 'superadmin', 'subadmin'].includes(req.user.role);
+
+    let query = allowCrossTenantDiscovery ? {} : { ...req.tenantFilter };
 
     // If not superadmin, also include global forms shared with this tenant
-    if (req.user.role !== 'superadmin' && req.user.tenantId) {
+    if (req.user.role !== 'superadmin' && req.user.tenantId && !allowCrossTenantDiscovery) {
       const tenantIdStr = req.user.tenantId.toString();
       const tenantIdObj = mongoose.Types.ObjectId.isValid(tenantIdStr)
         ? new mongoose.Types.ObjectId(tenantIdStr)
         : null;
       const tenantValues = [tenantIdStr, tenantIdObj].filter(Boolean);
 
-      query = {
+      // Find all parent forms accessible by this tenant to also include their child follow-ups
+      const accessibleParents = await Form.find({
         $or: [
           { tenantId: { $in: tenantValues } },
           { sharedWithTenants: { $in: tenantValues } },
           { "chassisTenantAssignments.assignedTenants": tenantIdStr }
+        ]
+      }).select('_id id childForms parentFormId').lean();
+
+      const linkedChildIds = [];
+      accessibleParents.forEach(p => {
+        (p.childForms || []).forEach(cf => {
+          const cfId = typeof cf === 'string' ? cf : (cf.formId || cf.id || cf._id);
+          if (cfId) linkedChildIds.push(cfId.toString());
+        });
+      });
+
+      const additionalObjectIds = linkedChildIds
+        .filter(id => mongoose.Types.ObjectId.isValid(id))
+        .map(id => new mongoose.Types.ObjectId(id));
+
+      const isStaffUser = ['inspector', 'subadmin', 'user'].includes(req.user.role);
+      const ownTenantClause = isStaffUser
+        ? {
+            tenantId: { $in: tenantValues },
+            isHidden: { $ne: true },
+            isVisible: { $ne: false }
+          }
+        : { tenantId: { $in: tenantValues } };
+
+      query = {
+        $or: [
+          ownTenantClause,
+          { sharedWithTenants: { $in: tenantValues } },
+          { "chassisTenantAssignments.assignedTenants": tenantIdStr },
+          { _id: { $in: additionalObjectIds } },
+          { id: { $in: linkedChildIds } }
         ]
       };
     } else if (req.user.role === 'superadmin' && queryTenantId) {
@@ -402,7 +450,22 @@ export const getAllForms = async (req, res) => {
       query = {
         $or: [
           { tenantId: { $in: tenantValues } },
-          { sharedWithTenants: { $in: tenantValues } }
+          { sharedWithTenants: { $in: tenantValues } },
+          { "chassisTenantAssignments.assignedTenants": tenantIdStr }
+        ]
+      };
+    } else if (allowCrossTenantDiscovery && req.user.role === 'subadmin' && req.user.tenantId) {
+      // Subadmin doing cross-tenant discovery should not see hidden forms from their OWN tenant
+      const tenantIdStr = req.user.tenantId.toString();
+      const tenantIdObj = mongoose.Types.ObjectId.isValid(tenantIdStr)
+        ? new mongoose.Types.ObjectId(tenantIdStr)
+        : null;
+      const tenantValues = [tenantIdStr, tenantIdObj].filter(Boolean);
+
+      query = {
+        $or: [
+          { tenantId: { $nin: tenantValues } },
+          { tenantId: { $in: tenantValues }, isHidden: { $ne: true }, isVisible: { $ne: false } }
         ]
       };
     }
@@ -442,9 +505,58 @@ export const getAllForms = async (req, res) => {
       }
     }
 
-    // Filter by visibility
-    if (isVisible !== undefined) {
-      query.isVisible = isVisible === 'true';
+    // Filter by visibility / hide
+    // For unauthenticated or guest requests, hide non-visible/hidden forms
+    if (!req.user || req.user.isGuest) {
+      const publicCondition = [
+        { isHidden: { $ne: true } },
+        { isVisible: { $ne: false } }
+      ];
+      if (query.$and) {
+        query.$and.push(...publicCondition);
+      } else if (query.$or) {
+        query = {
+          $and: [
+            { $or: query.$or },
+            ...publicCondition
+          ]
+        };
+      } else {
+        query.isHidden = { $ne: true };
+        query.isVisible = { $ne: false };
+      }
+    } else {
+      // Explicit query parameters (e.g. from Admin filters)
+      if (isVisible !== undefined) {
+        const isVisibleVal = isVisible === 'true';
+        if (query.$and) {
+          query.$and.push({ isVisible: isVisibleVal });
+        } else if (query.$or) {
+          query = {
+            $and: [
+              { $or: query.$or },
+              { isVisible: isVisibleVal }
+            ]
+          };
+        } else {
+          query.isVisible = isVisibleVal;
+        }
+      }
+      if (req.query.isHidden !== undefined) {
+        const isHiddenVal = req.query.isHidden === 'true';
+        if (query.$and) {
+          query.$and.push({ isHidden: isHiddenVal });
+        } else if (query.$or) {
+          query = {
+            $and: [
+              { $or: query.$or },
+              { isHidden: isHiddenVal }
+            ]
+          };
+        } else {
+          query.isHidden = isHiddenVal;
+        }
+      }
     }
 
     // Filter by active status
@@ -491,6 +603,7 @@ export const getAllForms = async (req, res) => {
       .filter(Boolean);
 
     let responseCountsMap = new Map();
+    let latestActivityMap = new Map();
     if (formIdsForCounts.length > 0) {
       const currentTenantId = req.user?.tenantId?.toString();
 
@@ -547,19 +660,33 @@ export const getAllForms = async (req, res) => {
                   "$questionId",
                   { $toString: "$formId" }
                 ]
-              }
+              },
+              createdAt: 1,
+              updatedAt: 1
             }
           },
           {
             $group: {
               _id: "$resolvedFormId",
-              count: { $sum: 1 }
+              count: { $sum: 1 },
+              latestResponseAt: { $max: "$createdAt" },
+              latestResponseUpdated: { $max: "$updatedAt" }
             }
           }
         ]);
 
-        countAgg.forEach(({ _id, count }) => {
-          if (_id) responseCountsMap.set(_id.toString(), count);
+        countAgg.forEach(({ _id, count, latestResponseAt, latestResponseUpdated }) => {
+          if (_id) {
+            const strId = _id.toString();
+            responseCountsMap.set(strId, count);
+            const maxTimestamp = Math.max(
+              latestResponseAt ? new Date(latestResponseAt).getTime() : 0,
+              latestResponseUpdated ? new Date(latestResponseUpdated).getTime() : 0
+            );
+            if (maxTimestamp > 0) {
+              latestActivityMap.set(strId, new Date(maxTimestamp).toISOString());
+            }
+          }
         });
       }
 
@@ -599,8 +726,9 @@ export const getAllForms = async (req, res) => {
               }
             ]
           });
-          if (id1) responseCountsMap.set(id1, filteredCount);
-          if (id2) responseCountsMap.set(id2, filteredCount);
+          const primaryId = id2 || id1;
+          responseCountsMap.set(primaryId, filteredCount);
+          if (id1 && id1 !== primaryId) responseCountsMap.set(id1, 0);
         } else {
           if (id1) responseCountsMap.set(id1, 0);
           if (id2) responseCountsMap.set(id2, 0);
@@ -614,9 +742,24 @@ export const getAllForms = async (req, res) => {
       const count1 = id1 ? (responseCountsMap.get(id1) || 0) : 0;
       const count2 = (id2 && id2 !== id1) ? (responseCountsMap.get(id2) || 0) : 0;
       const responseCount = count1 + count2;
+
+      const act1 = id1 ? latestActivityMap.get(id1) : null;
+      const act2 = id2 ? latestActivityMap.get(id2) : null;
+      const actTime1 = act1 ? new Date(act1).getTime() : 0;
+      const actTime2 = act2 ? new Date(act2).getTime() : 0;
+      const latestRespTime = Math.max(actTime1, actTime2);
+      const latestResponseAt = latestRespTime > 0 ? new Date(latestRespTime).toISOString() : null;
+
+      const formUpd = form.updatedAt ? new Date(form.updatedAt).getTime() : 0;
+      const formCre = form.createdAt ? new Date(form.createdAt).getTime() : 0;
+      const latestActiveTimestamp = Math.max(latestRespTime, formUpd, formCre);
+      const lastActivityAt = latestActiveTimestamp > 0 ? new Date(latestActiveTimestamp).toISOString() : form.createdAt;
+
       return {
         ...form,
-        responseCount
+        responseCount,
+        latestResponseAt,
+        lastActivityAt
       };
     });
 
@@ -742,8 +885,9 @@ export const getFormById = async (req, res) => {
     }
 
     // Permission check for authenticated users (not public slug access)
-    // Superadmins and Admins can view forms across tenants (mutation routes still strictly restrict editing to owning tenant)
-    if (!tenantSlug && req.user && req.user.role !== 'superadmin' && req.user.role !== 'admin' && !req.user.isGuest) {
+    // Superadmins, Admins, and Subadmins can view forms across tenants (mutation routes still strictly restrict editing to owning tenant)
+    const isAdminOrSuper = ['superadmin', 'admin', 'subadmin'].includes(req.user?.role);
+    if (!tenantSlug && req.user && !isAdminOrSuper && !req.user.isGuest) {
       if (!req.user.tenantId) {
         return res.status(403).json({
           success: false,
@@ -763,6 +907,20 @@ export const getFormById = async (req, res) => {
         return res.status(403).json({
           success: false,
           message: 'Access denied. This form is not available for your organization.'
+        });
+      }
+    }
+
+    // Check if form is hidden for inspectors and users of the OWNING tenant
+    if (req.user && ['inspector', 'user'].includes(req.user.role)) {
+      const userTenantIdStr = (req.user.tenantId?._id || req.user.tenantId)?.toString() || '';
+      const formTenantIdStr = (form.tenantId?._id || form.tenantId)?.toString() || '';
+      const isOwnTenantForm = Boolean(formTenantIdStr && userTenantIdStr && formTenantIdStr === userTenantIdStr);
+
+      if (isOwnTenantForm && (form.isHidden === true || form.isVisible === false)) {
+        return res.status(403).json({
+          success: false,
+          message: 'Access denied. This form is currently hidden by your organization administration.'
         });
       }
     }
@@ -804,25 +962,6 @@ export const getFormById = async (req, res) => {
       return res.status(404).json({
         success: false,
         message: 'Form not found'
-      });
-    }
-
-    // Debug logging - ADD THIS TO CHECK SUGGESTION
-    console.log('=== DEBUG: Checking suggestions in form ===');
-    console.log('Form ID:', form.id);
-    console.log('Form type:', typeof form);
-
-    if (form.sections && form.sections.length > 0) {
-      form.sections.forEach((section, idx) => {
-        console.log(`Section ${idx}: ${section.title}, Questions: ${section.questions?.length || 0}`);
-        if (section.questions) {
-          section.questions.forEach((q, qIdx) => {
-            console.log(`  Q${qIdx}: "${q.text}"`);
-            console.log(`    Has suggestion field?`, 'suggestion' in q);
-            console.log(`    Suggestion value:`, q.suggestion);
-            console.log(`    All keys:`, Object.keys(q));
-          });
-        }
       });
     }
 
@@ -879,41 +1018,53 @@ export const getFormById = async (req, res) => {
         item._id = dc._id.toString();
         item.id = dc.id;
         item.formTitle = dc.title || item.formTitle;
+        item.sections = dc.sections || [];
       });
 
-      const enrichedChildForms = [];
-      for (const [key, cf] of childMap.entries()) {
-        const cIds = [cf.formId, cf.id, cf._id].filter(Boolean);
-        const count = await Response.countDocuments({
-          questionId: { $in: cIds },
-          isSectionSubmit: { $ne: true }
-        });
-        enrichedChildForms.push({
-          ...cf,
-          responseCount: count
-        });
-      }
-      formObj.childForms = enrichedChildForms;
+      const childEntries = Array.from(childMap.values());
+      const childCounts = await Promise.all(
+        childEntries.map(cf => {
+          const cIds = [cf.formId, cf.id, cf._id].filter(Boolean);
+          return Response.countDocuments({
+            questionId: { $in: cIds },
+            isSectionSubmit: { $ne: true }
+          }).maxTimeMS(5000).catch(() => 0);
+        })
+      );
+      formObj.childForms = childEntries.map((cf, idx) => ({
+        ...cf,
+        responseCount: childCounts[idx] || 0
+      }));
 
       // 2. If this form itself is a child form, attach parentForm details
+      const formIdentifiers = [formObj.id, formObj._id ? formObj._id.toString() : null].filter(Boolean);
+      let parentConditions = [];
       if (formObj.parentFormId) {
-        const pDoc = await Form.findOne({
-          $or: [
-            { id: formObj.parentFormId },
-            { _id: mongoose.Types.ObjectId.isValid(formObj.parentFormId) ? new mongoose.Types.ObjectId(formObj.parentFormId) : null }
-          ].filter(Boolean)
-        }).select('id _id title sections chassisNumbers').lean();
+        parentConditions.push({ id: formObj.parentFormId });
+        if (mongoose.Types.ObjectId.isValid(formObj.parentFormId)) {
+          parentConditions.push({ _id: new mongoose.Types.ObjectId(formObj.parentFormId) });
+        }
+      }
+      if (formIdentifiers.length > 0) {
+        parentConditions.push({ 'childForms.formId': { $in: formIdentifiers } });
+      }
+
+      if (parentConditions.length > 0) {
+        const pDoc = await Form.findOne({ $or: parentConditions }).select('id _id title sections chassisNumbers').lean();
 
         if (pDoc) {
+          formObj.parentFormId = formObj.parentFormId || pDoc._id.toString();
+          formObj.parentFormTitle = formObj.parentFormTitle || pDoc.title;
           const pCount = await Response.countDocuments({
             questionId: { $in: [pDoc.id, pDoc._id.toString()] },
             isSectionSubmit: { $ne: true }
-          });
+          }).maxTimeMS(5000).catch(() => 0);
           formObj.parentForm = {
             _id: pDoc._id.toString(),
             id: pDoc.id,
             title: pDoc.title,
-            responseCount: pCount
+            responseCount: pCount,
+            sections: pDoc.sections || []
           };
 
           // If child form has empty sections, inherit sections from parent form with Chassis Number tracking
@@ -949,18 +1100,18 @@ export const getFormById = async (req, res) => {
         const defaultQuestions = formObj.followUpQuestions && formObj.followUpQuestions.length > 0
           ? formObj.followUpQuestions
           : [
-              {
-                id: 'chassis-number-q',
-                text: 'Chassis Number',
-                type: 'text',
-                required: true,
-                trackResponseQuestion: true,
-                trackResponseRank: true,
-                trackResponseRankLabel: 'Chassis Number',
-                trackResponseQuestionLabel: 'Chassis Number',
-                placeholder: 'Enter Chassis Number / VIN...'
-              }
-            ];
+            {
+              id: 'chassis-number-q',
+              text: 'Chassis Number',
+              type: 'text',
+              required: true,
+              trackResponseQuestion: true,
+              trackResponseRank: true,
+              trackResponseRankLabel: 'Chassis Number',
+              trackResponseQuestionLabel: 'Chassis Number',
+              placeholder: 'Enter Chassis Number / VIN...'
+            }
+          ];
 
         formObj.sections = [
           {
@@ -1003,8 +1154,9 @@ export const updateForm = async (req, res) => {
     }
 
     // Check permissions
+    const isUserAdminOrSuper = ['admin', 'superadmin', 'subadmin'].includes(req.user.role);
     if (form.createdBy && req.user._id && form.createdBy.toString() !== req.user._id.toString() &&
-      req.user.role !== 'admin' && req.user.role !== 'superadmin') {
+      !isUserAdminOrSuper) {
       const userPerms = req.user.permissions || [];
       const formIdStr = form._id?.toString();
       const customIdStr = form.id?.toString();
@@ -1024,41 +1176,60 @@ export const updateForm = async (req, res) => {
       }
     }
 
-    // For admin, ensure they can only edit forms in their tenant
-    if (req.user.role === 'admin' && form.tenantId && req.user.tenantId && form.tenantId.toString() !== req.user.tenantId.toString()) {
+    // For admin/subadmin, ensure they can only edit forms in their tenant or forms shared with their tenant
+    const formTenantIdStr = (form.tenantId?._id || form.tenantId)?.toString() || '';
+    const userTenantIdStr = (req.user.tenantId?._id || req.user.tenantId)?.toString() || '';
+    const isSharedWithThisTenant = Array.isArray(form.sharedWithTenants) && form.sharedWithTenants.some(t => {
+      const tId = (t?._id || t)?.toString();
+      return tId && tId === userTenantIdStr;
+    });
+
+    if (['admin', 'subadmin'].includes(req.user.role) &&
+      formTenantIdStr &&
+      userTenantIdStr &&
+      formTenantIdStr !== userTenantIdStr &&
+      !isSharedWithThisTenant) {
       return res.status(403).json({
         success: false,
-        message: 'Access denied. You can only edit forms in your organization.'
+        message: 'Access denied. You can only edit forms in your organization or shared with your organization.'
       });
     }
 
     // Update form
     const updateData = { ...req.body };
 
-    // Only superadmin and admin can change isGlobal and sharedWithTenants
-    if (req.user.role !== 'superadmin' && req.user.role !== 'admin') {
+    // Only authorized roles can change sharedWithTenants
+    const canManageSharing = ['superadmin', 'admin', 'subadmin', 'tenant_admin'].includes(req.user.role);
+    if (!canManageSharing) {
       delete updateData.isGlobal;
       delete updateData.sharedWithTenants;
       delete updateData.tenantId;
     }
-    // Admin can update sharedWithTenants but not isGlobal or tenantId
-    if (req.user.role === 'admin') {
+    // Admin / subadmin cannot update isGlobal or tenantId
+    if (['admin', 'subadmin'].includes(req.user.role)) {
       delete updateData.isGlobal;
       delete updateData.tenantId;
     }
 
+    // Never unintentionally strip existing parent-child relationships if undefined in updateData
+    if (updateData.parentFormId === undefined) delete updateData.parentFormId;
+    if (updateData.parentFormTitle === undefined) delete updateData.parentFormTitle;
+    if (updateData.childForms === undefined) delete updateData.childForms;
+
     Object.assign(form, updateData);
 
-    try {
-      normalizeSectionWeightage(form.sections);
-    } catch (error) {
-      if (error instanceof SectionWeightageError) {
-        return res.status(400).json({
-          success: false,
-          message: error.message
-        });
+    if (req.body.sections !== undefined) {
+      try {
+        normalizeSectionWeightage(form.sections);
+      } catch (error) {
+        if (error instanceof SectionWeightageError) {
+          return res.status(400).json({
+            success: false,
+            message: error.message
+          });
+        }
+        throw error;
       }
-      throw error;
     }
 
     // Normalize question types before saving (handles spaces/slashes) using global utility
@@ -1075,6 +1246,9 @@ export const updateForm = async (req, res) => {
     }
 
     await form.save();
+
+    clearFormCache();
+    emitFormsChanged({ action: 'updated', formId: form._id ? form._id.toString() : form.id, tenantId: form.tenantId });
 
     res.json({
       success: true,
@@ -1135,7 +1309,7 @@ export const deleteForm = async (req, res) => {
     }
 
     const isSuperAdmin = req.user.role === 'superadmin';
-    const isAdmin = req.user.role === 'admin';
+    const isAdmin = ['admin', 'subadmin'].includes(req.user.role);
     const formTenantIdStr = (form.tenantId?._id || form.tenantId)?.toString();
     const userTenantIdStr = (req.user.tenantId?._id || req.user.tenantId)?.toString();
     const formCreatorIdStr = (form.createdBy?._id || form.createdBy)?.toString();
@@ -1166,6 +1340,30 @@ export const deleteForm = async (req, res) => {
     // For admin, ensure they can only delete forms in their tenant (if both tenant IDs are present)
     if (isAdmin && !isSuperAdmin) {
       if (formTenantIdStr && userTenantIdStr && formTenantIdStr !== userTenantIdStr) {
+        // If this form was shared with or assigned to the admin's tenant, treat delete as unsharing / removing from this organization
+        const isSharedWithUserTenant =
+          (Array.isArray(form.sharedWithTenants) && form.sharedWithTenants.some(t => (t?._id || t)?.toString() === userTenantIdStr)) ||
+          (Array.isArray(form.chassisTenantAssignments) && form.chassisTenantAssignments.some(cta => cta.assignedTenants?.some(at => (at?._id || at)?.toString() === userTenantIdStr)));
+
+        if (isSharedWithUserTenant) {
+          form.sharedWithTenants = (form.sharedWithTenants || []).filter(t => (t?._id || t)?.toString() !== userTenantIdStr);
+          if (Array.isArray(form.chassisTenantAssignments)) {
+            form.chassisTenantAssignments.forEach(cta => {
+              if (Array.isArray(cta.assignedTenants)) {
+                cta.assignedTenants = cta.assignedTenants.filter(at => (at?._id || at)?.toString() !== userTenantIdStr);
+              }
+            });
+          }
+          form.markModified('sharedWithTenants');
+          form.markModified('chassisTenantAssignments');
+          await form.save();
+
+          return res.json({
+            success: true,
+            message: 'Form removed from your organization successfully'
+          });
+        }
+
         return res.status(403).json({
           success: false,
           message: 'Access denied. You can only delete forms in your organization.'
@@ -1203,6 +1401,9 @@ export const deleteForm = async (req, res) => {
     // 4. Delete form using the form's _id (MongoDB ObjectId)
     await Form.findByIdAndDelete(form._id);
 
+    clearFormCache();
+    emitFormsChanged({ action: 'deleted', formId: form._id ? form._id.toString() : form.id, tenantId: form.tenantId });
+
     res.json({
       success: true,
       message: 'Form and related responses deleted successfully'
@@ -1220,7 +1421,7 @@ export const deleteForm = async (req, res) => {
 export const updateFormVisibility = async (req, res) => {
   try {
     const { id } = req.params;
-    const { isVisible } = req.body;
+    let { isVisible, isHidden } = req.body;
 
     // Use the helper function to find form by either custom id or MongoDB _id
     const form = await findFormByIdentifier(id);
@@ -1232,29 +1433,41 @@ export const updateFormVisibility = async (req, res) => {
       });
     }
 
-    // Check permissions
-    if (form.createdBy && req.user._id && form.createdBy.toString() !== req.user._id.toString() &&
-      req.user.role !== 'admin' && req.user.role !== 'superadmin') {
+    // Permission check: Only Superadmin or the Admin of the OWNING tenant can hide/unhide this form
+    const formTenantIdStr = (form.tenantId?._id || form.tenantId)?.toString() || '';
+    const userTenantIdStr = (req.user.tenantId?._id || req.user.tenantId)?.toString() || '';
+    const isSuperAdmin = req.user.role === 'superadmin';
+    const isOwningAdmin = req.user.role === 'admin' && (!formTenantIdStr || (userTenantIdStr && formTenantIdStr === userTenantIdStr));
+
+    if (!isSuperAdmin && !isOwningAdmin) {
       return res.status(403).json({
         success: false,
-        message: 'Access denied. You can only modify your own forms.'
+        message: 'Access denied. Only the Admin of the owning organization can hide or unhide this form.'
       });
     }
 
-    // For admin, ensure they can only modify forms in their tenant
-    if (req.user.role === 'admin' && form.tenantId && req.user.tenantId && form.tenantId.toString() !== req.user.tenantId.toString()) {
-      return res.status(403).json({
-        success: false,
-        message: 'Access denied. You can only modify forms in your organization.'
-      });
+    // Synchronize isHidden and isVisible
+    if (typeof isHidden === 'boolean') {
+      form.isHidden = isHidden;
+      if (typeof isVisible !== 'boolean') {
+        form.isVisible = !isHidden;
+      }
+    }
+    if (typeof isVisible === 'boolean') {
+      form.isVisible = isVisible;
+      if (typeof isHidden !== 'boolean') {
+        form.isHidden = !isVisible;
+      }
     }
 
-    form.isVisible = isVisible;
     await form.save();
+
+    clearFormCache();
+    emitFormsChanged({ action: 'updated', formId: form._id ? form._id.toString() : form.id, tenantId: form.tenantId });
 
     res.json({
       success: true,
-      message: `Form ${isVisible ? 'published' : 'unpublished'} successfully`,
+      message: `Form ${form.isHidden ? 'hidden from inspectors & subadmins' : 'made visible'} successfully`,
       data: { form }
     });
 
@@ -1296,14 +1509,14 @@ export const updateFormLocationEnabled = async (req, res) => {
     }
 
     if (form.createdBy && req.user._id && form.createdBy.toString() !== req.user._id.toString() &&
-      req.user.role !== 'admin' && req.user.role !== 'superadmin') {
+      !['admin', 'superadmin', 'subadmin'].includes(req.user.role)) {
       return res.status(403).json({
         success: false,
         message: 'Access denied. You can only modify your own forms.'
       });
     }
 
-    if (req.user.role === 'admin' && form.tenantId && req.user.tenantId && form.tenantId.toString() !== req.user.tenantId.toString()) {
+    if (['admin', 'subadmin'].includes(req.user.role) && form.tenantId && req.user.tenantId && form.tenantId.toString() !== req.user.tenantId.toString()) {
       return res.status(403).json({
         success: false,
         message: 'Access denied. You can only modify forms in your organization.'
@@ -1398,15 +1611,15 @@ export const updateFormActiveStatus = async (req, res) => {
 
     // Check permissions
     if (form.createdBy && req.user._id && form.createdBy.toString() !== req.user._id.toString() &&
-      req.user.role !== 'admin' && req.user.role !== 'superadmin') {
+      !['admin', 'superadmin', 'subadmin'].includes(req.user.role)) {
       return res.status(403).json({
         success: false,
         message: 'Access denied. You can only modify your own forms.'
       });
     }
 
-    // For admin, ensure they can only modify forms in their tenant
-    if (req.user.role === 'admin' && form.tenantId && req.user.tenantId && form.tenantId.toString() !== req.user.tenantId.toString()) {
+    // For admin/subadmin, ensure they can only modify forms in their tenant
+    if (['admin', 'subadmin'].includes(req.user.role) && form.tenantId && req.user.tenantId && form.tenantId.toString() !== req.user.tenantId.toString()) {
       return res.status(403).json({
         success: false,
         message: 'Access denied. You can only modify forms in your organization.'
@@ -1458,15 +1671,15 @@ export const updateFormViewType = async (req, res) => {
 
     // Check permissions
     if (form.createdBy && req.user._id && form.createdBy.toString() !== req.user._id.toString() &&
-      req.user.role !== 'admin' && req.user.role !== 'superadmin') {
+      !['admin', 'superadmin', 'subadmin'].includes(req.user.role)) {
       return res.status(403).json({
         success: false,
         message: 'Access denied. You can only modify your own forms.'
       });
     }
 
-    // For admin, ensure they can only modify forms in their tenant
-    if (req.user.role === 'admin' && form.tenantId && req.user.tenantId && form.tenantId.toString() !== req.user.tenantId.toString()) {
+    // For admin/subadmin, ensure they can only modify forms in their tenant
+    if (['admin', 'subadmin'].includes(req.user.role) && form.tenantId && req.user.tenantId && form.tenantId.toString() !== req.user.tenantId.toString()) {
       return res.status(403).json({
         success: false,
         message: 'Access denied. You can only modify forms in your organization.'
@@ -1548,6 +1761,9 @@ export const duplicateForm = async (req, res) => {
 
     const duplicateForm = new Form(duplicateData);
     await duplicateForm.save();
+
+    clearFormCache();
+    emitFormsChanged({ action: 'duplicated', formId: duplicateForm._id ? duplicateForm._id.toString() : duplicateForm.id, tenantId: duplicateForm.tenantId });
 
     res.status(201).json({
       success: true,
@@ -1772,15 +1988,15 @@ export const updateFollowUpConfig = async (req, res) => {
 
     // Check permissions
     if (form.createdBy && req.user._id && form.createdBy.toString() !== req.user._id.toString() &&
-      req.user.role !== 'admin' && req.user.role !== 'superadmin') {
+      !['admin', 'superadmin', 'subadmin'].includes(req.user.role)) {
       return res.status(403).json({
         success: false,
         message: 'Access denied. You can only modify your own forms.'
       });
     }
 
-    // For admin, ensure they can only modify forms in their tenant
-    if (req.user.role === 'admin' && form.tenantId && req.user.tenantId && form.tenantId.toString() !== req.user.tenantId.toString()) {
+    // For admin/subadmin, ensure they can only modify forms in their tenant
+    if (['admin', 'subadmin'].includes(req.user.role) && form.tenantId && req.user.tenantId && form.tenantId.toString() !== req.user.tenantId.toString()) {
       return res.status(403).json({
         success: false,
         message: 'Access denied. You can only modify forms in your organization.'
@@ -1936,17 +2152,16 @@ export const linkChildForm = async (req, res) => {
       });
     }
 
-    // Check if forms belong to the same tenant
-    if (parentForm.tenantId.toString() !== childForm.tenantId.toString()) {
-      return res.status(400).json({
-        success: false,
-        message: 'Parent and child forms must belong to the same organization'
-      });
-    }
+    // Support cross-tenant / tenant-wise form linking:
+    // When linking an existing form from another tenant, our goal is purely response matching by chassis/VIN.
+    // We do NOT modify parentForm.sharedWithTenants (parent form must never appear on the other tenant's dashboard).
+    // We do NOT modify childForm.sharedWithTenants (to prevent child form from lingering on parent's dashboard when unlinked).
+    const isCrossTenantLink = parentForm.tenantId && childForm.tenantId &&
+      parentForm.tenantId.toString() !== childForm.tenantId.toString();
 
     // Check permissions
-    if (parentForm.createdBy.toString() !== req.user._id.toString() &&
-      req.user.role !== 'admin' && req.user.role !== 'superadmin') {
+    if (parentForm.createdBy && parentForm.createdBy.toString() !== req.user._id.toString() &&
+      !['admin', 'superadmin', 'subadmin'].includes(req.user.role)) {
       return res.status(403).json({
         success: false,
         message: 'Access denied. You can only modify your own forms.'
@@ -1959,29 +2174,46 @@ export const linkChildForm = async (req, res) => {
     }
 
     // Check if child form is already linked
+    const childIdStr = childForm.id ? String(childForm.id) : '';
+    const childMongoIdStr = childForm._id ? String(childForm._id) : '';
     const existingLink = parentForm.childForms.find(
-      cf => cf.formId === childForm.id
+      cf => (childIdStr && cf.formId === childIdStr) || (childMongoIdStr && cf.formId === childMongoIdStr)
     );
 
     if (existingLink) {
-      return res.status(400).json({
-        success: false,
-        message: 'This form is already linked as a child form'
+      if (!isCrossTenantLink) {
+        childForm.parentFormId = parentForm._id ? parentForm._id.toString() : parentForm.id;
+        childForm.parentFormTitle = parentForm.title;
+        await childForm.save();
+      }
+      return res.json({
+        success: true,
+        message: 'This form is already linked as a child form',
+        data: { parentForm, childForm }
       });
     }
 
-    // Add child form
+    // Add child form to parentForm.childForms
     const order = parentForm.childForms.length;
     parentForm.childForms.push({
-      formId: childForm.id,
+      formId: childForm._id ? childForm._id.toString() : childForm.id,
       formTitle: childForm.title,
       order
     });
 
-    // Also set parentFormId on child form for bidirectional consistency
-    childForm.parentFormId = parentForm.id || parentForm._id.toString();
+    // Only set parentFormId on child form if it's within the SAME organization/tenant.
+    // For cross-tenant forms, the child form must keep its own independent standalone identity in its own tenant,
+    // so Saify/vendor inspectors and admins can continue using it normally without interference.
+    if (!isCrossTenantLink) {
+      childForm.parentFormId = parentForm._id ? parentForm._id.toString() : parentForm.id;
+      childForm.parentFormTitle = parentForm.title;
+      await childForm.save();
+    }
 
-    await Promise.all([parentForm.save(), childForm.save()]);
+    await parentForm.save();
+
+    clearFormCache();
+    emitFormsChanged({ action: 'linked', parentFormId: parentForm._id ? parentForm._id.toString() : parentForm.id, childFormId: childForm._id ? childForm._id.toString() : childForm.id });
 
     res.json({
       success: true,
@@ -2020,49 +2252,81 @@ export const unlinkChildForm = async (req, res) => {
 
     // Check permissions
     if (parentForm.createdBy.toString() !== req.user._id.toString() &&
-      req.user.role !== 'admin' && req.user.role !== 'superadmin') {
+      !['admin', 'superadmin', 'subadmin'].includes(req.user.role)) {
       return res.status(403).json({
         success: false,
         message: 'Access denied. You can only modify your own forms.'
       });
     }
 
-    if (!parentForm.childForms || parentForm.childForms.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'No child forms linked to this parent form'
-      });
+    if (!parentForm.childForms) {
+      parentForm.childForms = [];
     }
 
-    const initialLength = parentForm.childForms.length;
+    const targetChildForm = await findFormByIdentifier(childFormId);
+    const targetChildMongoId = targetChildForm?._id ? targetChildForm._id.toString() : '';
+    const targetChildUuid = targetChildForm?.id ? String(targetChildForm.id) : '';
+
     parentForm.childForms = parentForm.childForms.filter(
-      cf => cf.formId !== childFormId
+      cf => cf.formId !== childFormId &&
+        (!targetChildMongoId || cf.formId !== targetChildMongoId) &&
+        (!targetChildUuid || cf.formId !== targetChildUuid)
     );
-
-    if (parentForm.childForms.length === initialLength) {
-      return res.status(404).json({
-        success: false,
-        message: 'Child form not found in parent form'
-      });
-    }
 
     // Reorder remaining child forms
     parentForm.childForms.forEach((cf, index) => {
       cf.order = index;
     });
 
+    parentForm.markModified('childForms');
     await parentForm.save();
 
-    // Also clear parentFormId on child form if it points to this parent
+    // Clean up cross-tenant references if any exist
     try {
       const childForm = await findFormByIdentifier(childFormId);
-      if (childForm && (childForm.parentFormId === parentForm.id || childForm.parentFormId === parentForm._id.toString())) {
-        childForm.parentFormId = null;
-        await childForm.save();
+      if (childForm) {
+        let childModified = false;
+
+        // Clear parentFormId if it points to this parent
+        if (childForm.parentFormId === parentForm.id || childForm.parentFormId === parentForm._id.toString()) {
+          childForm.parentFormId = null;
+          childModified = true;
+        }
+
+        // Revoke cross-tenant sharing so unlinked child form disappears completely from parent tenant
+        if (parentForm.tenantId && childForm.sharedWithTenants && childForm.sharedWithTenants.length > 0) {
+          const parentTenantStr = parentForm.tenantId.toString();
+          const initialShareLen = childForm.sharedWithTenants.length;
+          childForm.sharedWithTenants = childForm.sharedWithTenants.filter(
+            t => t && t.toString() !== parentTenantStr
+          );
+          if (childForm.sharedWithTenants.length !== initialShareLen) {
+            childForm.markModified('sharedWithTenants');
+            childModified = true;
+          }
+        }
+
+        if (childModified) {
+          await childForm.save();
+        }
+
+        // Revoke child's tenant from parentForm.sharedWithTenants if present
+        if (childForm.tenantId && parentForm.sharedWithTenants && parentForm.sharedWithTenants.length > 0) {
+          const childTenantStr = childForm.tenantId.toString();
+          parentForm.sharedWithTenants = parentForm.sharedWithTenants.filter(
+            t => t && t.toString() !== childTenantStr
+          );
+          parentForm.markModified('sharedWithTenants');
+        }
       }
     } catch (childErr) {
-      console.warn('Failed to clear child parentFormId:', childErr);
+      console.warn('Failed to clean up child form references on unlink:', childErr);
     }
+
+    await parentForm.save();
+
+    clearFormCache();
+    emitFormsChanged({ action: 'unlinked', parentFormId: parentForm._id ? parentForm._id.toString() : parentForm.id, childFormId });
 
     res.json({
       success: true,
@@ -2120,7 +2384,9 @@ export const getChildForms = async (req, res) => {
             isVisible: childForm.isVisible,
             isActive: childForm.isActive,
             order: childRef.order,
-            responseCount: cCount
+            responseCount: cCount,
+            sharedWithTenants: childForm.sharedWithTenants || [],
+            tenantId: childForm.tenantId
           });
         }
       }
@@ -2170,7 +2436,7 @@ export const reorderChildForms = async (req, res) => {
 
     // Check permissions
     if (parentForm.createdBy.toString() !== req.user._id.toString() &&
-      req.user.role !== 'admin' && req.user.role !== 'superadmin') {
+      !['admin', 'superadmin', 'subadmin'].includes(req.user.role)) {
       return res.status(403).json({
         success: false,
         message: 'Access denied. You can only modify your own forms.'
@@ -2468,6 +2734,9 @@ export const importFormFromCSV = async (req, res) => {
     await Promise.all(parameterPromises);
     console.log(`Created ${parametersToCreate.size} parameters for form`);
 
+    clearFormCache();
+    emitFormsChanged({ action: 'imported', formId: form._id ? form._id.toString() : form.id, tenantId: form.tenantId });
+
     res.status(201).json({
       success: true,
       message: 'Form imported successfully from CSV',
@@ -2720,7 +2989,11 @@ export const submitPublicResponse = async (req, res) => {
     }
 
     // Get the form
-    const form = await Form.findOne({ id: id });
+    const searchConditions = [{ id: id }];
+    if (mongoose.Types.ObjectId.isValid(id)) {
+      searchConditions.push({ _id: new mongoose.Types.ObjectId(String(id)) }, { _id: id });
+    }
+    const form = await Form.findOne({ $or: searchConditions });
     console.log("📋 Form found:", form ? "YES" : "NO");
 
     if (!form) {
@@ -2777,17 +3050,23 @@ export const submitPublicResponse = async (req, res) => {
     }
 
     // ========== DUPLICATE SUBMISSION PREVENTION ==========
-    const targetSessionId = sessionId || formSession?.sessionId;
+    const isDuplicateConfirmed = req.body?.confirmDuplicate === true || req.body?.confirmDuplicateChassis === true;
+    const targetSessionId = isDuplicateConfirmed ? null : (sessionId || formSession?.sessionId);
     if (targetSessionId && !isSectionSubmit) {
       const Response = mongoose.model('Response');
+      const searchFormConditions = [{ questionId: id }, { formId: id }];
+      if (mongoose.Types.ObjectId.isValid(id)) {
+        searchFormConditions.push({ questionId: new mongoose.Types.ObjectId(String(id)) }, { formId: new mongoose.Types.ObjectId(String(id)) });
+      }
       const existingSessionResponse = await Response.findOne({
-        $or: [
-          { questionId: id },
-          { formId: id }
-        ],
-        $or: [
-          { sessionId: targetSessionId },
-          { 'submissionMetadata.sessionId': targetSessionId }
+        $and: [
+          { $or: searchFormConditions },
+          {
+            $or: [
+              { sessionId: targetSessionId },
+              { 'submissionMetadata.sessionId': targetSessionId }
+            ]
+          }
         ]
       });
       if (existingSessionResponse) {

@@ -16,6 +16,9 @@ import smsService from '../services/smsService.js';
 // Helper function to get location from IP address
 const getLocationFromIP = async (ip) => {
   try {
+    if (!ip || typeof ip !== 'string') {
+      return null;
+    }
     // Skip private/local IPs
     if (ip === '127.0.0.1' || ip === '::1' || ip.startsWith('192.168.') || ip.startsWith('10.') || ip.startsWith('172.')) {
       return null;
@@ -95,12 +98,16 @@ export const login = async (req, res) => {
     }
 
     console.log('Searching by identifier (email or username):', identifier);
-    user = await User.findOne({
-      $or: [
-        { email: identifier.toLowerCase() },
-        { username: identifier }
-      ]
-    });
+    const isEmail = identifier.includes('@');
+    if (isEmail) {
+      user = await User.findOne({ email: identifier.toLowerCase() });
+    }
+    if (!user) {
+      user = await User.findOne({ username: identifier });
+    }
+    if (!user && !isEmail) {
+      user = await User.findOne({ email: identifier.toLowerCase() });
+    }
 
     if (!user) {
       console.log('Login failed: User not found in DB');
@@ -142,8 +149,12 @@ export const login = async (req, res) => {
       : Promise.resolve(null);
       
     const formsPromise = (user.role !== 'superadmin' && user.tenantId)
-      ? Form.find({ tenantId: user.tenantId, isGlobal: false })
-          .select('id _id title category isGlobal parentFormId childForms tenantId status isActive createdAt')
+      ? Form.find({
+          tenantId: user.tenantId,
+          isGlobal: false,
+          ...(['inspector', 'subadmin', 'user'].includes(user.role) ? { isHidden: { $ne: true }, isVisible: { $ne: false } } : {})
+        })
+          .select('id _id title category isGlobal parentFormId childForms tenantId status isActive isHidden isVisible createdAt')
           .sort({ createdAt: -1 })
           .limit(50)
           .lean()

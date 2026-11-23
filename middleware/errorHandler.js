@@ -60,9 +60,6 @@ export const errorHandler = (err, req, res, next) => {
 };
 
 export const notFound = (req, res, next) => {
-  if (req.originalUrl.includes('favicon.ico')) {
-    return res.status(204).end();
-  }
   const error = new Error(`Route not found - ${req.originalUrl}`);
   error.statusCode = 404;
   res.status(404);

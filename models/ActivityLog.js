@@ -81,7 +81,7 @@ const activityLogSchema = new mongoose.Schema({
   createdAt: {
     type: Date,
     default: Date.now,
-    expires: '90d' // Auto-delete after 90 days
+    expires: '14d' // Auto-delete after 14 days (reduced from 90d to conserve storage)
   }
 });
 

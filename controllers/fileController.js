@@ -118,40 +118,74 @@ export const uploadFile = async (req, res) => {
     const associatedType = typeMap[rawAssociatedType] || 'form';
     const associatedIdentifier = normalizeValue(bodyAssociatedId) || normalizeValue(queryAssociatedId);
 
-    // Upload to Cloudinary
     const folder = `focus_forms/${associatedType}`;
     const filename = `${Date.now()}_${req.file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
     
-    const cloudinaryResult = await uploadToCloudinary(req.file.buffer, filename, folder);
+    let fileUrl = null;
+    let cloudinaryResult = null;
+
+    // 1. Try Cloudinary if configured
+    if (process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET) {
+      try {
+        cloudinaryResult = await uploadToCloudinary(req.file.buffer, filename, folder);
+        if (cloudinaryResult && cloudinaryResult.secure_url) {
+          fileUrl = cloudinaryResult.secure_url;
+        }
+      } catch (cloudErr) {
+        console.warn(`[FILE UPLOAD] Cloudinary upload failed (${cloudErr.message}), falling back to disk storage...`);
+      }
+    }
+
+    // 2. Reliable Fallback: Save to server disk (uploads/ folder)
+    if (!fileUrl) {
+      const uploadsDir = path.join(process.cwd(), 'uploads');
+      if (!fs.existsSync(uploadsDir)) {
+        fs.mkdirSync(uploadsDir, { recursive: true });
+      }
+      const localFilePath = path.join(uploadsDir, filename);
+      await fs.promises.writeFile(localFilePath, req.file.buffer);
+
+      const host = req.get('host');
+      const protocol = req.protocol === 'https' || req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
+      fileUrl = `${protocol}://${host}/api/uploads/${filename}`;
+      console.log(`[FILE UPLOAD] Stored file locally on disk: ${fileUrl}`);
+    }
 
     const associatedWith = { type: associatedType };
     if (associatedIdentifier) {
       associatedWith.id = associatedIdentifier;
     }
 
-    const fileRecord = new File({
+    let fileData = {
       filename: req.file.originalname,
       originalName: req.file.originalname,
       mimetype: req.file.mimetype,
       size: req.file.size,
-      cloudinaryPublicId: cloudinaryResult.public_id,
-      cloudinaryUrl: cloudinaryResult.secure_url,
-      url: cloudinaryResult.secure_url,
-      uploadedBy: req.user ? req.user._id : null,
-      associatedWith,
+      url: fileUrl,
       isPublic: true
-    });
+    };
 
-    await fileRecord.save();
-
-    const fileData = fileRecord.toObject();
+    // Try saving record in DB if writable, without failing the upload if DB is in read-only quota mode
+    try {
+      const fileRecord = new File({
+        ...fileData,
+        cloudinaryPublicId: cloudinaryResult ? cloudinaryResult.public_id : null,
+        cloudinaryUrl: cloudinaryResult ? cloudinaryResult.secure_url : null,
+        uploadedBy: req.user ? req.user._id : null,
+        associatedWith,
+      });
+      await fileRecord.save();
+      fileData = fileRecord.toObject();
+    } catch (dbErr) {
+      console.warn(`[FILE UPLOAD] Database File save skipped (quota/readonly):`, dbErr.message);
+    }
 
     res.json({
       success: true,
       message: 'File uploaded successfully',
       data: {
         file: fileData,
-        url: fileData.url
+        url: fileUrl
       }
     });
 
@@ -167,6 +201,12 @@ export const uploadFile = async (req, res) => {
 export const getFile = async (req, res) => {
   try {
     const { filename } = req.params;
+
+    // Check if file exists directly on disk in uploads directory
+    const diskPath = path.join(process.cwd(), 'uploads', filename);
+    if (fs.existsSync(diskPath)) {
+      return res.sendFile(path.resolve(diskPath));
+    }
 
     // Check if filename is a valid ObjectId (database file ID)
     const mongoose = (await import('mongoose')).default;
@@ -205,6 +245,14 @@ export const getFile = async (req, res) => {
         }
       });
       return downloadStream.pipe(res);
+    }
+
+    // If it has a url pointing to uploads, check local disk again with that filename
+    if (fileRecord.filename) {
+      const altDiskPath = path.join(process.cwd(), 'uploads', fileRecord.filename);
+      if (fs.existsSync(altDiskPath)) {
+        return res.sendFile(path.resolve(altDiskPath));
+      }
     }
 
     return res.status(404).json({

@@ -16,6 +16,8 @@ export const cacheMiddleware = (duration = 300) => {
       return next();
     }
 
+    const shouldBypass = req.query.forceNetwork === 'true' || req.query.bypassCache === 'true' || req.headers['cache-control'] === 'no-cache';
+
     // Generate unique key based on URL and user/tenant
     // We must isolate cache per tenant/user if applicable
     const userId = req.user ? (req.user._id || req.user.id) : 'guest';
@@ -26,7 +28,7 @@ export const cacheMiddleware = (duration = 300) => {
     
     const cachedBody = appCache.get(key);
     
-    if (cachedBody) {
+    if (!shouldBypass && cachedBody) {
       // Send cached response
       res.setHeader('X-Cache', 'HIT');
       return res.json(JSON.parse(cachedBody));
@@ -44,27 +46,16 @@ export const cacheMiddleware = (duration = 300) => {
   };
 };
 
-/**
- * Invalidate cached items matching a pattern or string.
- * If no pattern is provided, flushes all keys.
- * @param {string|RegExp} [pattern]
- */
-export const invalidateCache = (pattern) => {
+export const clearFormCache = () => {
   try {
-    if (!pattern) {
-      appCache.flushAll();
-      return;
-    }
     const keys = appCache.keys();
-    for (const key of keys) {
-      if (typeof pattern === 'string' && key.includes(pattern)) {
-        appCache.del(key);
-      } else if (pattern instanceof RegExp && pattern.test(key)) {
+    keys.forEach(key => {
+      if (key.includes('form') || key.includes('__express__') || key.includes('analytics') || key.includes('response')) {
         appCache.del(key);
       }
-    }
+    });
   } catch (err) {
-    console.error('Error invalidating cache:', err);
+    console.warn('Error clearing form cache:', err);
   }
 };
 

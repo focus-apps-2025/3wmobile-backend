@@ -89,6 +89,8 @@ const FollowUpQuestionSchema = new mongoose.Schema({
   min: Number,
   max: Number,
   step: Number,
+  minLabel: String,
+  maxLabel: String,
   showWhen: ShowWhenSchema,
   parentId: String,
   imageUrl: {
@@ -176,6 +178,10 @@ const FormSchema = new mongoose.Schema({
   followUpQuestions: [FollowUpQuestionSchema],
   parentFormId: String,
   parentFormTitle: String,
+  isChildForm: {
+    type: Boolean,
+    default: false
+  },
   childForms: [{
     formId: String,
     formTitle: String,
@@ -183,6 +189,10 @@ const FormSchema = new mongoose.Schema({
   }],
   sectionBranching: [SectionBranchingRuleSchema], // Array of section branching rules
   isVisible: {
+    type: Boolean,
+    default: false
+  },
+  isHidden: {
     type: Boolean,
     default: false
   },
@@ -471,6 +481,7 @@ FormSchema.pre('save', function(next) {
 FormSchema.index({ id: 1 });
 FormSchema.index({ createdBy: 1 });
 FormSchema.index({ isVisible: 1 });
+FormSchema.index({ isHidden: 1 });
 FormSchema.index({ isActive: 1 });
 FormSchema.index({ tenantId: 1 });
 FormSchema.index({ sharedWithTenants: 1 });

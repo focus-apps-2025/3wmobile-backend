@@ -209,7 +209,14 @@ export const getDashboardStats = async (req, res) => {
             _id: {
               $dateToString: {
                 format: '%Y-%m-%d',
-                date: '$createdAt'
+                date: {
+                  $convert: {
+                    input: '$createdAt',
+                    to: 'date',
+                    onError: new Date(0),
+                    onNull: new Date(0)
+                  }
+                }
               }
             },
             count: { $sum: 1 }
@@ -529,7 +536,14 @@ export const getUserAnalytics = async (req, res) => {
           _id: {
             $dateToString: {
               format: '%Y-%m-%d',
-              date: '$lastLogin'
+              date: {
+                $convert: {
+                  input: '$lastLogin',
+                  to: 'date',
+                  onError: new Date(0),
+                  onNull: new Date(0)
+                }
+              }
             }
           },
           count: { $sum: 1 }
@@ -1868,7 +1882,24 @@ export const getInspectorSummary = async (req, res) => {
     const { role, _id: userId, tenantId: userTenantId } = req.user;
     const { startDate, endDate, formId, tenantId: queryTenantId } = req.query;
 
+    const shouldBypassCache = req.query.forceNetwork === 'true' || req.query.bypassCache === 'true';
+    const cacheKey = 'insp_summary_' + (userTenantId || 'superadmin') + '_' + (formId || 'all') + '_' + (startDate || '') + '_' + (endDate || '') + '_' + (queryTenantId || '');
+    if (!shouldBypassCache) {
+      const cached = appCache.get(cacheKey);
+      if (cached) {
+        return res.json(cached);
+      }
+    }
+
     let matchFilter = {};
+
+    // Helper to get array of [string, ObjectId] for any tenantId
+    const getTenantValues = (tId) => {
+      if (!tId) return [];
+      const tIdStr = tId.toString();
+      const tIdObj = mongoose.Types.ObjectId.isValid(tIdStr) ? new mongoose.Types.ObjectId(tIdStr) : null;
+      return [tIdStr, tIdObj].filter(Boolean);
+    };
 
     // Internal Tracking: Check for cross-tenant access first
     if (queryTenantId && queryTenantId !== userTenantId?.toString()) {
@@ -1886,7 +1917,8 @@ export const getInspectorSummary = async (req, res) => {
       }
 
       if (hasAccess) {
-        matchFilter = { tenantId: new mongoose.Types.ObjectId(queryTenantId) };
+        const vals = getTenantValues(queryTenantId);
+        matchFilter = { tenantId: vals.length === 1 ? vals[0] : { $in: vals } };
       } else {
         return res.status(403).json({ success: false, message: 'Access to this tenant is denied for Inspector Summary.' });
       }
@@ -1895,12 +1927,13 @@ export const getInspectorSummary = async (req, res) => {
       if (role === 'superadmin') {
         // No initial filter for superadmin, can see all
       } else if (role === 'admin' || role === 'subadmin') {
-        matchFilter.tenantId = new mongoose.Types.ObjectId(userTenantId);
+        const vals = getTenantValues(userTenantId);
+        matchFilter.tenantId = vals.length === 1 ? vals[0] : { $in: vals };
       } else if (role === 'inspector') {
         matchFilter.createdBy = new mongoose.Types.ObjectId(userId);
       } else {
-        // Default for other roles if any
-        matchFilter.tenantId = new mongoose.Types.ObjectId(userTenantId);
+        const vals = getTenantValues(userTenantId);
+        matchFilter.tenantId = vals.length === 1 ? vals[0] : { $in: vals };
       }
     }
 
@@ -1908,24 +1941,27 @@ export const getInspectorSummary = async (req, res) => {
       matchFilter.questionId = formId;
     }
 
-    // Date filtering - handle inclusive days
+    // Date filtering - handle inclusive days and IST timezone boundaries
     if (startDate || endDate) {
       matchFilter.createdAt = {};
       if (startDate) {
-        const s = new Date(startDate);
-        s.setHours(0, 0, 0, 0);
+        const s = new Date(startDate.includes('T') ? startDate : `${startDate}T00:00:00.000Z`);
         matchFilter.createdAt.$gte = s;
       }
       if (endDate) {
-        const e = new Date(endDate);
-        e.setHours(23, 59, 59, 999);
+        const e = new Date(endDate.includes('T') ? endDate : `${endDate}T23:59:59.999Z`);
         matchFilter.createdAt.$lte = e;
       }
     }
 
-    // Fetch all relevant responses
+    // Fetch all relevant responses (capped with maxTimeMS to prevent server blocking)
     console.log('getInspectorSummary - matchFilter:', JSON.stringify(matchFilter, null, 2));
-    const responses = await Response.find(matchFilter).sort({ createdAt: 1 }).lean();
+    const responses = await Response.find(matchFilter)
+      .sort({ createdAt: -1 })
+      .limit(5000)
+      .maxTimeMS(15000)
+      .select('_id questionId formId status answers chassisNumber createdBy submittedBy createdAt biwReview tenantId isDispatched')
+      .lean();
     console.log(`getInspectorSummary - found: ${responses?.length || 0} responses`);
 
     if (!responses || responses.length === 0) {
@@ -2013,6 +2049,18 @@ export const getInspectorSummary = async (req, res) => {
         let isRejected = false;
         let foundStatus = null;
 
+        if (r.review?.status || r.review?.reviewOption) {
+          const rs = String(r.review.status || r.review.reviewOption).toLowerCase();
+          if (rs.includes('reject')) isRejected = true;
+          else if (rs.includes('rework')) isRework = true;
+          else if (rs.includes('accept') || rs.includes('ok')) isAccepted = true;
+        }
+        if (r.status) {
+          const st = String(r.status).toLowerCase();
+          if (st.includes('reject')) isRejected = true;
+          else if (st.includes('rework')) isRework = true;
+        }
+
         const answersObj = r.answers instanceof Map ? Object.fromEntries(r.answers) : r.answers;
         if (answersObj) {
           Object.values(answersObj).forEach(ans => {
@@ -2068,26 +2116,77 @@ export const getInspectorSummary = async (req, res) => {
       });
     });
 
+    // First, lookup all users matching submitter names across these responses
+    const submitterNames = [...new Set(
+      responses
+        .map(r => (r.submittedBy || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim())
+        .filter(n => n && n.toLowerCase() !== 'excel import' && n.toLowerCase() !== 'anonymous')
+    )];
+
+    let submitterUsers = [];
+    if (submitterNames.length > 0) {
+      const orClauses = [];
+      submitterNames.forEach(name => {
+        const cleanLower = name.toLowerCase();
+        orClauses.push({ email: cleanLower });
+        orClauses.push({ username: { $regex: new RegExp(`^${name}$`, 'i') } });
+        orClauses.push({ $expr: { $eq: [{ $toLower: { $concat: ['$firstName', ' ', '$lastName'] } }, cleanLower] } });
+        orClauses.push({ $expr: { $eq: [{ $toLower: { $concat: ['$firstName', '$lastName'] } }, cleanLower.replace(/\s+/g, '')] } });
+
+        const parts = name.split(' ').filter(Boolean);
+        if (parts.length >= 2) {
+          const first = parts.slice(0, -1).join(' ');
+          const last = parts[parts.length - 1];
+          orClauses.push({
+            firstName: { $regex: new RegExp(`^${first}`, 'i') },
+            lastName: { $regex: new RegExp(`^${last}`, 'i') }
+          });
+        }
+      });
+      submitterUsers = await User.find({ $or: orClauses }).lean();
+    }
+
+    const nameToUserMap = {};
+    submitterUsers.forEach(u => {
+      const fn = `${u.firstName || ''} ${u.lastName || ''}`.replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+      if (fn) nameToUserMap[fn] = u;
+      if (u.username) nameToUserMap[u.username.toLowerCase()] = u;
+      if (u.email) nameToUserMap[u.email.toLowerCase()] = u;
+      if (u.firstName) nameToUserMap[u.firstName.toLowerCase()] = u;
+    });
+
     // Now aggregate per inspector and date
     const inspectorData = {};
     for (const r of responses) {
-      const creatorId = r.createdBy?.toString();
-      if (!creatorId) continue;
+      const rawSub = (r.submittedBy || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+      let matchedInspUser = null;
+      if (rawSub && rawSub.toLowerCase() !== 'excel import') {
+        matchedInspUser = nameToUserMap[rawSub.toLowerCase()];
+      }
+
+      const inspectorId = matchedInspUser ? matchedInspUser._id.toString() : (r.createdBy?.toString() || rawSub || 'unknown');
+      const inspectorName = matchedInspUser
+        ? `${matchedInspUser.firstName} ${matchedInspUser.lastName}`.trim()
+        : (rawSub || 'Unknown Inspector');
+
+      if (!inspectorId || inspectorId === 'unknown') continue;
 
       // Extract date string YYYY-MM-DD in IST (Asia/Kolkata)
-      const d = new Date(r.createdAt);
-      // Adjust to IST manually to be safe
-      const istDate = new Date(d.getTime() + (5.5 * 60 * 60 * 1000));
+      const rawDate = r.createdAt ? new Date(r.createdAt) : new Date();
+      const validTime = !isNaN(rawDate.getTime()) ? rawDate.getTime() : Date.now();
+      const istDate = new Date(validTime + (5.5 * 60 * 60 * 1000));
       const dateIST = istDate.toISOString().split('T')[0];
       const formId = r.questionId?.toString() || 'unknown';
-      const key = `${creatorId}_${dateIST}_${formId}`;
+      const key = `${inspectorId}_${dateIST}_${formId}`;
 
       if (!inspectorData[key]) {
         inspectorData[key] = {
-          userId: creatorId,
+          userId: inspectorId,
+          inspectorName: inspectorName,
+          matchedUser: matchedInspUser,
           date: dateIST,
           formId: formId,
-          tenantId: r.tenantId,
+          tenantId: matchedInspUser?.tenantId || r.tenantId,
           totalInspection: 0,
           statusCounts: {
             'Direct Ok': 0,
@@ -2118,7 +2217,7 @@ export const getInspectorSummary = async (req, res) => {
     // Join with User, Tenant, and Shift details
     const finalSummary = [];
     const entryKeys = Object.keys(inspectorData);
-    const userIds = [...new Set(entryKeys.map(k => inspectorData[k].userId))];
+    const userIds = [...new Set(entryKeys.map(k => inspectorData[k].userId).filter(id => mongoose.Types.ObjectId.isValid(id)))];
     const formIdsToFetch = [...new Set(entryKeys.map(k => inspectorData[k].formId))].filter(id => id !== 'unknown');
 
     const users = await User.find({ _id: { $in: userIds } }).lean();
@@ -2129,17 +2228,16 @@ export const getInspectorSummary = async (req, res) => {
       ]
     }).lean();
 
-    const tenantIds = [...new Set(users.map(u => u.tenantId))];
+    const tenantIds = [...new Set([...users.map(u => u.tenantId), ...submitterUsers.map(u => u.tenantId)].filter(Boolean))];
     const tenants = await Tenant.find({ _id: { $in: tenantIds } }).lean();
     const shifts = await Shift.find({ tenantId: { $in: tenantIds }, isActive: true }).lean();
 
     for (const key of entryKeys) {
       const stats = inspectorData[key];
-      const user = users.find(u => u._id.toString() === stats.userId);
-      if (!user) continue;
+      const user = users.find(u => u._id.toString() === stats.userId) || stats.matchedUser;
 
-      const tenant = tenants.find(t => t._id.toString() === user.tenantId?.toString());
-      const shift = shifts.find(s => s.assignedInspectors.some(id => id.toString() === stats.userId));
+      const tenant = user ? tenants.find(t => t._id.toString() === user.tenantId?.toString()) : null;
+      const shift = user ? shifts.find(s => s.assignedInspectors.some(id => id.toString() === stats.userId)) : null;
       const formInfo = fetchedForms.find(f => f.id === stats.formId || f._id.toString() === stats.formId);
 
       finalSummary.push({
@@ -2147,12 +2245,12 @@ export const getInspectorSummary = async (req, res) => {
         date: stats.date,
         shift: shift ? shift.displayName : 'N/A',
         formTitle: formInfo ? formInfo.title : 'N/A',
-        qcInspector: `${user.firstName} ${user.lastName}`,
-        role: user.role,
-        username: user.username,
-        email: user.email,
-        isActive: user.isActive,
-        status: user.status,
+        qcInspector: user ? `${user.firstName} ${user.lastName}`.trim() : (stats.inspectorName || 'Unknown Inspector'),
+        role: user ? user.role : 'inspector',
+        username: user ? user.username : '',
+        email: user ? user.email : '',
+        isActive: user ? user.isActive : true,
+        status: user ? user.status : 'active',
         totalInspection: stats.totalInspection,
         statusCounts: stats.statusCounts,
         userId: stats.userId,
@@ -2166,13 +2264,15 @@ export const getInspectorSummary = async (req, res) => {
     // Static display order for the main columns
     const allStatuses = ['Direct Ok', 'Rework QC Completed', 'Rework QC Pending', 'Rejected', 'Dispatched'];
 
-    res.json({
+    const responsePayload = {
       success: true,
       data: {
         summary: finalSummary,
         allStatuses
       }
-    });
+    };
+    appCache.set(cacheKey, responsePayload, 180);
+    res.json(responsePayload);
   } catch (error) {
     console.error('getInspectorSummary error:', error);
     res.status(500).json({ success: false, message: 'Internal server error' });
@@ -2256,7 +2356,7 @@ const performanceTableCache = new Map();
 
 const buildPerformanceTableCacheKey = ({
   tenantKey, startDate, endDate, formId, queryTenantId, page, limit
-}) => JSON.stringify({ tenantKey, startDate, endDate, formId, queryTenantId, page, limit });
+}) => JSON.stringify({ v: 'v29', tenantKey, startDate, endDate, formId, queryTenantId, page, limit });
 
 const getCachedPerformanceTable = (key) => {
   const entry = performanceTableCache.get(key);
@@ -2274,7 +2374,11 @@ const setCachedPerformanceTable = (key, payload) => {
 
 export const getPerformanceTable = async (req, res) => {
   try {
-    const { startDate, endDate, formId, tenantId: queryTenantId } = req.query;
+    const { startDate, endDate, formId, formIds: queryFormIds, tenantId: queryTenantId } = req.query;
+    const rawFormIds = queryFormIds || formId;
+    const formIdList = rawFormIds
+      ? (Array.isArray(rawFormIds) ? rawFormIds : String(rawFormIds).split(',')).map(s => s.trim()).filter(Boolean)
+      : [];
     const { role, tenantId: userTenantId, _id: userId } = req.user;
 
     // ── Pagination params ────────────────────────────────────────────────
@@ -2282,9 +2386,22 @@ export const getPerformanceTable = async (req, res) => {
     const limit = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 50));
     const skip = (page - 1) * limit;
 
-    const start = startDate ? new Date(startDate) : new Date(0);
-    const end = endDate ? new Date(endDate) : new Date();
-    if (endDate) end.setHours(23, 59, 59, 999);
+    let start = null;
+    let end = null;
+    if (startDate) {
+      const datePart = typeof startDate === 'string' && startDate.includes('T') ? startDate.split('T')[0] : startDate;
+      start = new Date(`${datePart}T00:00:00.000Z`);
+      if (isNaN(start.getTime())) start = new Date(0);
+    } else {
+      start = new Date(0);
+    }
+    if (endDate) {
+      const datePart = typeof endDate === 'string' && endDate.includes('T') ? endDate.split('T')[0] : endDate;
+      end = new Date(`${datePart}T23:59:59.999Z`);
+      if (isNaN(end.getTime())) end = new Date();
+    } else {
+      end = new Date();
+    }
 
     let tenantFilter = { ...req.tenantFilter };
     let crossTenantAccess = false;
@@ -2321,7 +2438,7 @@ export const getPerformanceTable = async (req, res) => {
       tenantKey: userTenantId?.toString() || 'superadmin',
       startDate: startDate || null,
       endDate: endDate || null,
-      formId: formId || null,
+      formId: formIdList.length > 0 ? formIdList.slice().sort().join(',') : null,
       queryTenantId: queryTenantId || null,
       page,
       limit
@@ -2347,26 +2464,24 @@ export const getPerformanceTable = async (req, res) => {
       usersQuery = { tenantId: new mongoose.Types.ObjectId(queryTenantId) };
     }
 
-    // `users` and the form lookup are independent of each other - the form
-    // lookup only feeds the *response* query below, not the users query -
-    // so fetch both concurrently instead of one after another.
     let formIdVariants = null;
+    let formDocs = [];
     let formDoc = null;
-    let formTenantId = null;
     let sharedWithTenants = [];
     let chassisTenantAssignments = [];
 
-    const formLookupPromise = formId
-      ? Form.findOne({
+    const formLookupPromise = formIdList.length > 0
+      ? Form.find({
         $or: [
-          { id: formId },
-          ...(mongoose.Types.ObjectId.isValid(formId) ? [{ _id: formId }] : []),
+          { id: { $in: formIdList } },
+          ...(formIdList.filter(id => mongoose.Types.ObjectId.isValid(id)).map(id => ({ _id: id }))),
+          { parentFormId: { $in: formIdList } }
         ],
       })
-        .select('id _id tenantId sharedWithTenants chassisTenantAssignments sections')
+        .select('id _id tenantId sharedWithTenants chassisTenantAssignments sections parentFormId')
         .maxTimeMS(30000)
         .lean()
-      : Promise.resolve(null);
+      : Promise.resolve([]);
 
     let [users, formLookupResult] = await Promise.all([
       User.find(usersQuery)
@@ -2379,52 +2494,289 @@ export const getPerformanceTable = async (req, res) => {
 
     console.log(`[Performance Table] Found ${users.length} users from current tenant(s)`);
 
-    if (formId) {
-      formDoc = formLookupResult;
-      if (formDoc) {
-        formTenantId = formDoc.tenantId?.toString();
-        sharedWithTenants = (formDoc.sharedWithTenants || []).map(id => id.toString());
-        chassisTenantAssignments = formDoc.chassisTenantAssignments || [];
-        formIdVariants = [formDoc.id, formDoc._id?.toString()].filter(Boolean);
-      } else {
-        formIdVariants = [formId];
+    if (formIdList.length > 0) {
+      formDocs = formLookupResult || [];
+      const matchedParents = formDocs.map(f => f._id?.toString() || f.id).filter(Boolean);
+      const childDocs = matchedParents.length > 0 ? await Form.find({
+        $or: [
+          { parentFormId: { $in: matchedParents } },
+          { parentFormId: { $in: formIdList } }
+        ]
+      }).select('id _id tenantId sharedWithTenants chassisTenantAssignments sections parentFormId').lean() : [];
+
+      const combinedDocs = [...formDocs, ...childDocs];
+      formDocs = combinedDocs;
+      formDoc = combinedDocs[0] || null;
+      formIdVariants = [];
+      combinedDocs.forEach(f => {
+        if (f.id) formIdVariants.push(f.id);
+        if (f._id) formIdVariants.push(f._id.toString());
+        (f.sharedWithTenants || []).forEach(id => sharedWithTenants.push(id.toString()));
+        if (f.chassisTenantAssignments) chassisTenantAssignments.push(...f.chassisTenantAssignments);
+      });
+      // Fallback: if not found in db directly, still use the passed ids
+      formIdList.forEach(id => {
+        if (!formIdVariants.includes(id)) formIdVariants.push(id);
+      });
+    } else {
+      // When no specific formId is passed, resolve all accessible forms for the user/tenant
+      // (base forms directly accessible to tenant + cross-tenant child forms like Saify paint forms)
+      const formQuery = {};
+      if (role === 'superadmin' && !queryTenantId) {
+        // Superadmin sees all forms
+      } else if (targetTenantId || userTenantId) {
+        const effectiveTId = targetTenantId || userTenantId;
+        const tIdObj = mongoose.Types.ObjectId.isValid(effectiveTId)
+          ? new mongoose.Types.ObjectId(effectiveTId)
+          : effectiveTId;
+
+        formQuery.$or = [
+          { tenantId: tIdObj },
+          { tenantId: effectiveTId.toString() },
+          { isGlobal: true },
+          { sharedWithTenants: effectiveTId.toString() },
+          { sharedWithTenants: tIdObj },
+          { 'chassisTenantAssignments.assignedTenants': effectiveTId.toString() }
+        ];
       }
+
+      const baseForms = await Form.find(formQuery)
+        .select('id _id tenantId sharedWithTenants chassisTenantAssignments sections parentFormId childForms')
+        .maxTimeMS(30000)
+        .lean();
+
+      const linkedChildIds = [];
+      baseForms.forEach(f => {
+        (f.childForms || []).forEach(cf => {
+          const cfId = typeof cf === 'string' ? cf : (cf.formId || cf.id || cf._id);
+          if (cfId) linkedChildIds.push(cfId.toString());
+        });
+        if (f.parentFormId) {
+          linkedChildIds.push(f.parentFormId.toString());
+        }
+      });
+
+      const childDocs = linkedChildIds.length > 0 ? await Form.find({
+        $or: [
+          { id: { $in: linkedChildIds } },
+          { _id: { $in: linkedChildIds.filter(id => mongoose.Types.ObjectId.isValid(id)).map(id => new mongoose.Types.ObjectId(id)) } }
+        ]
+      }).select('id _id tenantId sharedWithTenants chassisTenantAssignments sections parentFormId').maxTimeMS(30000).lean() : [];
+
+      // Deduplicate combined docs by MongoDB _id to prevent double-counting
+      const seenDocIds = new Set();
+      const combinedDocs = [...baseForms, ...childDocs].filter(f => {
+        const docId = f._id?.toString();
+        if (!docId || seenDocIds.has(docId)) return false;
+        seenDocIds.add(docId);
+        return true;
+      });
+      formDocs = combinedDocs;
+      formDoc = combinedDocs[0] || null;
+      formIdVariants = [];
+      combinedDocs.forEach(f => {
+        if (f.id) formIdVariants.push(f.id);
+        if (f._id) formIdVariants.push(f._id.toString());
+        (f.sharedWithTenants || []).forEach(id => sharedWithTenants.push(id.toString()));
+        if (f.chassisTenantAssignments) chassisTenantAssignments.push(...f.chassisTenantAssignments);
+      });
     }
 
-    // Build response query
+    // Preload form -> tenantId map for accurate plant-level accountability
+    const formTenantMap = new Map();
+    if (formDocs && formDocs.length > 0) {
+      formDocs.forEach(f => {
+        const tId = f.tenantId ? f.tenantId.toString() : null;
+        if (f.id && tId) formTenantMap.set(f.id, tId);
+        if (f._id && tId) formTenantMap.set(f._id.toString(), tId);
+      });
+    }
+
+    // Preload all tenants for fast plant name resolution
+    const allTenantsList = await Tenant.find({}).select('_id name companyName').lean();
+    const tenantNameMap = new Map();
+    allTenantsList.forEach(t => {
+      tenantNameMap.set(t._id.toString(), t.name || t.companyName || 'Unknown Plant');
+    });
+
+    // Build response query — must exclude section-submit responses to match getQualitySummary
     const responseBaseFilter = {
-      createdAt: { $gte: start, $lte: end }
+      createdAt: { $gte: start, $lte: end },
+      isSectionSubmit: { $ne: true }
     };
 
-    if (formId) {
+    if (formIdVariants && formIdVariants.length > 0) {
       responseBaseFilter.questionId = { $in: formIdVariants };
-    }
-
-    if (!formId) {
+    } else {
       Object.assign(responseBaseFilter, tenantFilter);
     }
 
-    // ── Total count (for hasMore) + paginated fetch ────────────────────
-    // NOTE: pagination here is applied to the *responses* query itself
-    // (skip/limit), not to the aggregated per-user table below - the
-    // aggregation is computed only over the current page of responses.
-    // This keeps memory bounded and response times fast even with
-    // thousands of responses, at the cost of the performance table
-    // reflecting only the responses in the current page rather than the
-    // full date range in one shot. The frontend pages through with
-    // `hasMore` to see the rest.
-    const [totalResponsesInRange, allResponses] = await Promise.all([
+    // ── Fetch all responses in date range (up to 10,000) for full per-user aggregation ──
+    const [totalResponsesInRange, allResponses, aggregatedInspectors] = await Promise.all([
       Response.countDocuments(responseBaseFilter).maxTimeMS(30000),
       Response.find(responseBaseFilter)
-        .select('createdBy submittedBy isDispatched biwReview answers questionId createdAt id _id')
-        .sort({ createdAt: -1 })
-        .skip(skip)
-        .limit(limit)
+        .select('createdBy submittedBy isDispatched biwReview review tvsReview status chassisNumber questionId createdAt id _id tenantId')
+        .limit(10000)
         .maxTimeMS(30000)
         .lean(),
+      Response.aggregate([
+        { $match: responseBaseFilter },
+        {
+          $group: {
+            _id: { $trim: { input: { $ifNull: ['$submittedBy', 'Unknown Submitter'] } } },
+            totalSubmitted: { $sum: 1 },
+            defectCount: {
+              $sum: {
+                $cond: [
+                  {
+                    $or: [
+                      { $in: ['$biwReview.status', ['Rejected', 'Reworked']] },
+                      { $in: ['$review.status', ['Rejected', 'Rework', 'Reworked']] },
+                      { $in: ['$review.reviewOption', ['Rejected', 'Rework', 'Reworked']] },
+                      { $regexMatch: { input: { $toLower: { $ifNull: ['$status', ''] } }, regex: 'rework|rejected|defect|fail' } },
+                      {
+                        $anyElementTrue: {
+                          $map: {
+                            input: { $objectToArray: { $ifNull: ['$answers', {}] } },
+                            as: 'ans',
+                            in: {
+                              $regexMatch: {
+                                input: {
+                                  $toLower: {
+                                    $ifNull: [
+                                      '$$ans.v.status',
+                                      {
+                                        $cond: [
+                                          { $eq: [{ $type: '$$ans.v' }, 'string'] },
+                                          '$$ans.v',
+                                          ''
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                },
+                                regex: 'rework|rejected|defect|fail|not ok'
+                              }
+                            }
+                          }
+                        }
+                      }
+                    ]
+                  },
+                  1,
+                  0
+                ]
+              }
+            },
+            rework1Count: {
+              $sum: {
+                $cond: [
+                  {
+                    $or: [
+                      { $eq: ['$biwReview.status', 'Reworked'] },
+                      { $in: ['$review.status', ['Rework', 'Reworked']] },
+                      { $in: ['$review.reviewOption', ['Rework', 'Reworked']] },
+                      { $regexMatch: { input: { $toLower: { $ifNull: ['$status', ''] } }, regex: 'rework' } }
+                    ]
+                  },
+                  1,
+                  0
+                ]
+              }
+            },
+            reworkAcceptedCount: {
+              $sum: {
+                $cond: [
+                  { $regexMatch: { input: { $toLower: { $ifNull: ['$status', ''] } }, regex: 'rework accept|rework complete' } },
+                  1,
+                  0
+                ]
+              }
+            },
+            rejectedCount: {
+              $sum: {
+                $cond: [
+                  {
+                    $or: [
+                      { $eq: ['$biwReview.status', 'Rejected'] },
+                      { $eq: ['$review.status', 'Rejected'] },
+                      { $eq: ['$review.reviewOption', 'Rejected'] },
+                      { $regexMatch: { input: { $toLower: { $ifNull: ['$status', ''] } }, regex: 'reject' } }
+                    ]
+                  },
+                  1,
+                  0
+                ]
+              }
+            },
+            dispatched: {
+              $sum: {
+                $cond: [
+                  {
+                    $or: [
+                      { $eq: ['$isDispatched', true] },
+                      { $and: [{ $ne: ['$dispatchedAt', null] }, { $gt: ['$dispatchedAt', ''] }] }
+                    ]
+                  },
+                  1,
+                  0
+                ]
+              }
+            },
+            biwTotalReviewed: {
+              $sum: { $cond: [{ $in: ['$biwReview.status', ['Accepted', 'Rejected', 'Reworked']] }, 1, 0] }
+            },
+            biwAccepted: {
+              $sum: { $cond: [{ $eq: ['$biwReview.status', 'Accepted'] }, 1, 0] }
+            },
+            biwRejected: {
+              $sum: { $cond: [{ $eq: ['$biwReview.status', 'Rejected'] }, 1, 0] }
+            },
+            biwReworked: {
+              $sum: { $cond: [{ $in: ['$biwReview.status', ['Rejected', 'Reworked']] }, 1, 0] }
+            },
+            tvsTotalReviewed: {
+              $sum: {
+                $cond: [
+                  { $or: [{ $in: ['$review.status', ['Accepted', 'Rejected', 'Rework', 'Reworked']] }, { $in: ['$review.reviewOption', ['Accepted', 'Rejected', 'Rework', 'Reworked']] }] },
+                  1,
+                  0
+                ]
+              }
+            },
+            tvsAccepted: {
+              $sum: {
+                $cond: [
+                  { $or: [{ $eq: ['$review.status', 'Accepted'] }, { $eq: ['$review.reviewOption', 'Accepted'] }] },
+                  1,
+                  0
+                ]
+              }
+            },
+            tvsRejected: {
+              $sum: {
+                $cond: [
+                  { $or: [{ $eq: ['$review.status', 'Rejected'] }, { $eq: ['$review.reviewOption', 'Rejected'] }] },
+                  1,
+                  0
+                ]
+              }
+            },
+            tvsReworked: {
+              $sum: {
+                $cond: [
+                  { $or: [{ $in: ['$review.status', ['Rework', 'Reworked']] }, { $in: ['$review.reviewOption', ['Rework', 'Reworked']] }] },
+                  1,
+                  0
+                ]
+              }
+            }
+          }
+        }
+      ]).option({ maxTimeMS: 30000, allowDiskUse: true })
     ]);
 
-    console.log(`[Performance Table] Found ${allResponses.length} responses on page ${page} (of ${totalResponsesInRange} total in range)`);
+    console.log(`[Performance Table] Found ${allResponses.length} responses (of ${totalResponsesInRange} total in range)`);
 
     // Filter responses for chassis-shared tenants
     let filteredResponses = allResponses;
@@ -2518,6 +2870,51 @@ export const getPerformanceTable = async (req, res) => {
       }
     }
 
+    // Also fetch users matching submittedBy names from responses so that accountability
+    // is attributed to the actual inspector rather than the user account that submitted/created the record.
+    const submitterNamesFromResponses = [...new Set(
+      filteredResponses
+        .map(r => (r.submittedBy || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim())
+        .filter(n => n && n.toLowerCase() !== 'excel import' && n.toLowerCase() !== 'anonymous')
+    )];
+
+    if (submitterNamesFromResponses.length > 0) {
+      try {
+        const allPotentialUsers = await User.find({})
+          .select('firstName lastName username email role tenantId isActive status performanceScore totalReviews acceptedCount rejectedCount reworkCount')
+          .populate('tenantId', 'name companyName')
+          .maxTimeMS(10000)
+          .lean();
+
+        const existingIds = new Set(users.map(u => u._id.toString()));
+        const matchedNewUsers = [];
+
+        submitterNamesFromResponses.forEach(name => {
+          const cleanLower = name.toLowerCase();
+          const found = allPotentialUsers.find(u => {
+            const fullName = `${u.firstName || ''} ${u.lastName || ''}`.replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+            return (
+              (fullName && fullName === cleanLower) ||
+              (u.email && u.email.toLowerCase() === cleanLower) ||
+              (u.username && u.username.toLowerCase() === cleanLower) ||
+              (u.firstName && u.firstName.toLowerCase() === cleanLower)
+            );
+          });
+          if (found && !existingIds.has(found._id.toString())) {
+            existingIds.add(found._id.toString());
+            matchedNewUsers.push(found);
+          }
+        });
+
+        if (matchedNewUsers.length > 0) {
+          users = [...users, ...matchedNewUsers];
+          console.log(`[Performance Table] Added ${matchedNewUsers.length} users matched from submittedBy names in memory`);
+        }
+      } catch (sErr) {
+        console.error('Error fetching users by submittedBy names:', sErr);
+      }
+    }
+
     // Get response IDs for review fetching
     const responseIds = [];
     filteredResponses.forEach(r => {
@@ -2560,7 +2957,10 @@ export const getPerformanceTable = async (req, res) => {
       ]
     };
 
-    const reviews = await Review.find(reviewQuery).maxTimeMS(30000).lean();
+    const reviews = await Review.find(reviewQuery)
+      .select('_id responseId response_id submitterId status reviewOption revieweeId createdBy userId submittedBy')
+      .maxTimeMS(15000)
+      .lean();
     console.log(`[Performance Table] Found ${reviews.length} reviews`);
 
     // Get reviewer IDs from reviews
@@ -2668,62 +3068,18 @@ export const getPerformanceTable = async (req, res) => {
 
     console.log(`[Performance Table] Total users available: ${Object.keys(userMap).length}`);
 
-    // Process reviews and build review map. `submitterIdType` (when present
-    // on the review doc) short-circuits the lookup instead of trying every
-    // map in sequence.
-    const reviewMap = {};
-
+    // Process reviews indexed by responseId so that review outcomes (Accepted,
+    // Rejected, Reworked) are credited to the INSPECTOR who submitted the response,
+    // rather than the reviewer who performed the review.
+    const reviewsByResponseId = new Map();
     reviews.forEach(review => {
-      const submitterId = review.submitterId || review.submittedBy || review.createdBy || review.userId || review.revieweeId;
-
-      if (!submitterId) return;
-
-      let submitterIdStr = String(submitterId);
-      let mappedUserId = null;
-
-      if (userMap[submitterIdStr]) {
-        mappedUserId = submitterIdStr;
-      } else if (review.submitterIdType === 'email' && emailToUserId[submitterIdStr.toLowerCase()]) {
-        mappedUserId = emailToUserId[submitterIdStr.toLowerCase()];
-      } else if (review.submitterIdType === 'username' && usernameToUserId[submitterIdStr.toLowerCase()]) {
-        mappedUserId = usernameToUserId[submitterIdStr.toLowerCase()];
-      } else if (emailToUserId[submitterIdStr.toLowerCase()]) {
-        mappedUserId = emailToUserId[submitterIdStr.toLowerCase()];
-      } else if (usernameToUserId[submitterIdStr.toLowerCase()]) {
-        mappedUserId = usernameToUserId[submitterIdStr.toLowerCase()];
-      } else if (nameToUserId[submitterIdStr.toLowerCase()]) {
-        mappedUserId = nameToUserId[submitterIdStr.toLowerCase()];
-      } else if (mongoose.Types.ObjectId.isValid(submitterIdStr)) {
-        try {
-          const objId = new mongoose.Types.ObjectId(submitterIdStr);
-          if (userMap[objId.toString()]) {
-            mappedUserId = objId.toString();
-          }
-        } catch (err) {
-          // Not a valid ObjectId
-        }
-      }
-
-      const finalUserId = mappedUserId || submitterIdStr;
-
-      if (!reviewMap[finalUserId]) {
-        reviewMap[finalUserId] = { total: 0, accepted: 0, rejected: 0, rework: 0 };
-      }
-
-      const reviewOption = review.reviewOption || review.status || review.option || review.reviewStatus;
-
-      reviewMap[finalUserId].total++;
-
-      if (reviewOption === 'Accepted' || reviewOption === 'accept' || reviewOption === 'approved') {
-        reviewMap[finalUserId].accepted++;
-      } else if (reviewOption === 'Rejected' || reviewOption === 'reject' || reviewOption === 'rejected') {
-        reviewMap[finalUserId].rejected++;
-      } else if (reviewOption === 'Rework' || reviewOption === 'rework' || reviewOption === 'reworked') {
-        reviewMap[finalUserId].rework++;
+      const rId = String(review.responseId || review.response_id || review.response || '');
+      if (rId && !reviewsByResponseId.has(rId)) {
+        reviewsByResponseId.set(rId, review);
       }
     });
 
-    console.log(`[Performance Table] Review map has ${Object.keys(reviewMap).length} entries`);
+    console.log(`[Performance Table] Reviews by response ID map has ${reviewsByResponseId.size} entries`);
 
     // Helper: Determine inspection status
     const getInspectionStatus = (response) => {
@@ -2731,6 +3087,25 @@ export const getPerformanceTable = async (req, res) => {
       let isAccepted = false;
       let isRejected = false;
       let foundStatus = null;
+
+      // Check TVS Review (by response ID in reviewsByResponseId or on response document)
+      const rId1 = response._id ? response._id.toString() : '';
+      const rId2 = response.id ? String(response.id) : '';
+      const tvsReview = reviewsByResponseId.get(rId1) || reviewsByResponseId.get(rId2) || response.tvsReview || response.review;
+      const tvsStatus = tvsReview?.reviewOption || tvsReview?.status;
+      if (tvsStatus) {
+        const ts = String(tvsStatus).toLowerCase();
+        if (ts.includes('reject')) isRejected = true;
+        else if (ts.includes('rework')) isRework = true;
+        else if (ts.includes('accept') || ts.includes('ok')) isAccepted = true;
+      }
+
+      if (response.biwReview?.status) {
+        const bs = String(response.biwReview.status).toLowerCase();
+        if (bs === 'accepted') isAccepted = true;
+        else if (bs === 'rejected') isRejected = true;
+        else if (bs === 'reworked' || bs === 'rework') isRework = true;
+      }
 
       const answersObj = response.answers instanceof Map ? Object.fromEntries(response.answers) : response.answers;
 
@@ -2748,7 +3123,7 @@ export const getPerformanceTable = async (req, res) => {
           if (!s) return;
           const sl = s.toLowerCase();
 
-          if (sl === 'rework' || sl === 'reworked' || sl.includes('re-rework')) {
+          if (sl === 'rework' || sl === 'reworked' || sl.includes('re-rework') || sl === 'defect' || sl === 'not ok') {
             isRework = true;
           } else if (
             sl === 'accepted' ||
@@ -2759,7 +3134,7 @@ export const getPerformanceTable = async (req, res) => {
             sl === 'rework accepted'
           ) {
             isAccepted = true;
-          } else if (sl === 'rejected' || sl === 'no') {
+          } else if (sl === 'rejected' || sl === 'no' || sl === 'fail') {
             isRejected = true;
           } else {
             foundStatus = s;
@@ -2770,8 +3145,16 @@ export const getPerformanceTable = async (req, res) => {
       if (isRejected) return 'Rejected';
       if (isRework) return 'Rework QC Pending';
       if (isAccepted) return 'Direct Ok';
+
+      if (response.status && response.status.toLowerCase() !== 'pending') {
+        const rsl = response.status.toLowerCase();
+        if (rsl.includes('reject')) return 'Rejected';
+        if (rsl.includes('rework')) return 'Rework QC Pending';
+        return response.status;
+      }
+
       if (foundStatus) return foundStatus;
-      return 'Pending';
+      return 'Direct Ok';
     };
 
     // Initialize stats for all users
@@ -2779,13 +3162,15 @@ export const getPerformanceTable = async (req, res) => {
 
     Object.values(userMap).forEach(user => {
       const uId = user._id.toString();
+      const tIdStr = user.tenantId?._id?.toString() || user.tenantId?.toString() || '';
+      const tName = (tIdStr && tenantNameMap.get(tIdStr)) || user.tenantId?.name || user.tenantId?.companyName || 'Unknown Plant';
       userStatsMap.set(uId, {
         userId: uId,
-        userName: `${user.firstName} ${user.lastName}`,
-        userEmail: user.email,
-        userRole: user.role,
-        tenantId: user.tenantId?.toString(),
-        tenantName: user.tenantId?.name || user.tenantId?.companyName || 'Unknown Tenant',
+        userName: `${user.firstName || ''} ${user.lastName || ''}`.trim(),
+        userEmail: user.email || '',
+        userRole: user.role || 'inspector',
+        tenantId: tIdStr,
+        tenantName: tName,
         totalSubmitted: 0,
         directOk: 0,
         reworkQcCompleted: 0,
@@ -2798,66 +3183,85 @@ export const getPerformanceTable = async (req, res) => {
         accepted: 0,
         rejectedReview: 0,
         reworked: 0,
+        biwTotalReviewed: 0,
+        biwReviewPending: 0,
+        biwAccepted: 0,
+        biwRejected: 0,
+        biwReworked: 0,
+        tvsTotalReviewed: 0,
+        tvsReviewPending: 0,
+        tvsAccepted: 0,
+        tvsRejected: 0,
+        tvsReworked: 0,
         performanceScore: 0,
         responses: []
       });
     });
 
-    // Add reviewers who aren't in the user map
-    Object.keys(reviewMap).forEach(reviewerId => {
-      if (!userStatsMap.has(reviewerId)) {
-        if (/^[0-9a-f]{24}$/i.test(reviewerId)) {
-          userStatsMap.set(reviewerId, {
-            userId: reviewerId,
-            userName: `User ${reviewerId.substring(0, 8)}`,
-            userEmail: '',
-            userRole: 'unknown',
-            tenantId: null,
-            tenantName: 'Cross-Tenant User',
-            totalSubmitted: 0,
-            directOk: 0,
-            reworkQcCompleted: 0,
-            reworkQcPending: 0,
-            rejected: 0,
-            dispatchPending: 0,
-            dispatched: 0,
-            totalReviewed: 0,
-            reviewPending: 0,
-            accepted: 0,
-            rejectedReview: 0,
-            reworked: 0,
-            performanceScore: 0,
-            responses: []
-          });
-        }
-      }
-    });
-
-    // Process responses (same logic as before, just over the current page)
+    // Process responses based on form submission accountability (submittedBy).
     filteredResponses.forEach(response => {
-      let userId = response.createdBy?.toString();
+      // Normalize whitespace including non-breaking spaces
+      const rawSubmittedBy = (response.submittedBy || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+      let matchedUser = null;
 
-      if (!userId) {
-        const userBySubmitted = users.find(u =>
-          u.email === response.submittedBy ||
-          u.username === response.submittedBy ||
-          `${u.firstName} ${u.lastName}` === response.submittedBy
-        );
-        if (userBySubmitted) {
-          userId = userBySubmitted._id.toString();
-        } else {
-          userId = response.submittedBy || 'unknown';
-        }
+      if (rawSubmittedBy && rawSubmittedBy.toLowerCase() !== 'excel import') {
+        const rawLower = rawSubmittedBy.toLowerCase();
+        matchedUser = users.find(u => {
+          const fullName = `${u.firstName || ''} ${u.lastName || ''}`.replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+          return (
+            (fullName && fullName === rawLower) ||
+            (u.email && u.email.toLowerCase() === rawLower) ||
+            (u.username && u.username.toLowerCase() === rawLower) ||
+            (u.firstName && u.firstName.toLowerCase() === rawLower)
+          );
+        });
       }
 
-      if (!userStatsMap.has(userId)) {
-        userStatsMap.set(userId, {
-          userId,
-          userName: response.submittedBy || 'Unknown User',
-          userEmail: '',
-          userRole: 'inspector',
-          tenantId: null,
-          tenantName: 'Cross-Tenant User',
+      // If submittedBy did not match any user in DB, but createdBy exists and submittedBy was empty / excel import
+      if (!matchedUser && (!rawSubmittedBy || rawSubmittedBy.toLowerCase() === 'excel import') && response.createdBy) {
+        matchedUser = userMap[response.createdBy.toString()];
+      }
+
+      const userId = matchedUser ? matchedUser._id.toString() : (rawSubmittedBy || 'unknown');
+      const userName = matchedUser
+        ? `${matchedUser.firstName} ${matchedUser.lastName}`.trim()
+        : (rawSubmittedBy || 'Unknown User');
+
+      // Resolve which plant / tenant this response belongs to
+      let respTenantId = response.tenantId ? response.tenantId.toString() : null;
+      if (!respTenantId && response.questionId) {
+        respTenantId = formTenantMap.get(response.questionId.toString()) || null;
+      }
+      if (!respTenantId) {
+        respTenantId = matchedUser?.tenantId ? (matchedUser.tenantId._id?.toString() || matchedUser.tenantId.toString()) : (userTenantId ? userTenantId.toString() : 'unknown');
+      }
+      const respTenantName = (respTenantId && tenantNameMap.get(respTenantId))
+        || (matchedUser?.tenantId?.name || matchedUser?.tenantId?.companyName)
+        || (respTenantId === userTenantId?.toString() ? (req.user?.tenantName || 'Main Plant') : 'Unknown Plant');
+
+      // Single entry per inspector/user to ensure exact match with Quality Summary / Pie Chart
+      let statsKey = matchedUser ? matchedUser._id.toString() : null;
+      if (!statsKey && rawSubmittedBy) {
+        const rawLower = rawSubmittedBy.toLowerCase();
+        for (const [k, s] of userStatsMap) {
+          if ((s.userName || '').toLowerCase() === rawLower) {
+            statsKey = k;
+            break;
+          }
+        }
+      }
+      if (!statsKey) {
+        statsKey = userId || 'unknown';
+      }
+
+      if (!userStatsMap.has(statsKey)) {
+        userStatsMap.set(statsKey, {
+          userId: statsKey,
+          userName: userName,
+          userEmail: matchedUser?.email || '',
+          userRole: matchedUser?.role || 'inspector',
+          tenantId: respTenantId,
+          tenantName: respTenantName,
           totalSubmitted: 0,
           directOk: 0,
           reworkQcCompleted: 0,
@@ -2870,12 +3274,28 @@ export const getPerformanceTable = async (req, res) => {
           accepted: 0,
           rejectedReview: 0,
           reworked: 0,
+          biwTotalReviewed: 0,
+          biwReviewPending: 0,
+          biwAccepted: 0,
+          biwRejected: 0,
+          biwReworked: 0,
+          tvsTotalReviewed: 0,
+          tvsReviewPending: 0,
+          tvsAccepted: 0,
+          tvsRejected: 0,
+          tvsReworked: 0,
           performanceScore: 0,
           responses: []
         });
+      } else {
+        const existingEntry = userStatsMap.get(statsKey);
+        if (respTenantName && respTenantName !== 'Unknown Plant' && (!existingEntry.tenantName || existingEntry.tenantName === 'Unknown Tenant' || existingEntry.tenantName === 'Unknown Plant')) {
+          existingEntry.tenantName = respTenantName;
+          if (respTenantId) existingEntry.tenantId = respTenantId;
+        }
       }
 
-      const stats = userStatsMap.get(userId);
+      const stats = userStatsMap.get(statsKey);
       stats.totalSubmitted++;
       stats.responses.push(response);
 
@@ -2884,6 +3304,8 @@ export const getPerformanceTable = async (req, res) => {
       else if (status === 'Rework QC Pending') stats.reworkQcPending++;
       else if (status === 'Rejected') stats.rejected++;
 
+      // Dispatched count is credited to the inspector who submitted the inspection form,
+      // regardless of who clicked the dispatch action.
       if (response.isDispatched) {
         stats.dispatched++;
       } else {
@@ -2893,74 +3315,162 @@ export const getPerformanceTable = async (req, res) => {
         }
       }
 
+      // Review outcomes are credited to the submitter of this inspected chassis
+      const rId1 = response._id ? response._id.toString() : '';
+      const rId2 = response.id ? String(response.id) : '';
+
+      // 1. BIW Review outcomes (from response.biwReview)
       const biwStatus = response.biwReview?.status;
-      if (biwStatus === 'Accepted') {
-        stats.accepted++;
-        stats.totalReviewed++;
-      } else if (biwStatus === 'Rejected') {
-        stats.rejectedReview++;
-        stats.totalReviewed++;
-      } else if (biwStatus === 'Reworked') {
-        stats.reworked++;
-        stats.totalReviewed++;
-      }
-    });
-
-    // Apply review stats
-    console.log('[Performance Table] Applying review stats to users...');
-
-    Object.entries(reviewMap).forEach(([reviewerId, reviewData]) => {
-      if (userStatsMap.has(reviewerId)) {
-        const stats = userStatsMap.get(reviewerId);
-        stats.accepted += reviewData.accepted;
-        stats.rejectedReview += reviewData.rejected;
-        stats.reworked += reviewData.rework;
-        stats.totalReviewed += reviewData.total;
-      }
-    });
-
-    // Calculate final metrics
-    for (const [userId, stats] of userStatsMap) {
-      stats.reviewPending = Math.max(0, stats.dispatched - stats.totalReviewed);
-      stats.performanceScore = stats.totalReviewed > 0
-        ? Math.round((stats.accepted / stats.totalReviewed) * 100)
-        : 0;
-
-      if (stats.responses.length > 0) {
-        const chassisGroups = new Map();
-        stats.responses.forEach(response => {
-          const answersObj = response.answers instanceof Map ? Object.fromEntries(response.answers) : response.answers;
-          let chassisKey = 'unknown';
-
-          for (const [key, value] of Object.entries(answersObj || {})) {
-            if (key.includes('chassis') || key.includes('Chassis')) {
-              chassisKey = String(value);
-              break;
-            }
-          }
-
-          if (!chassisGroups.has(chassisKey)) {
-            chassisGroups.set(chassisKey, []);
-          }
-          chassisGroups.get(chassisKey).push(response);
-        });
-
-        let reworkCompletedCount = 0;
-        for (const [chassisKey, chassisResponses] of chassisGroups) {
-          const sorted = chassisResponses.sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
-
-          sorted.forEach((response, index) => {
-            const status = getInspectionStatus(response);
-            if (status === 'Direct Ok' && index > 0) {
-              reworkCompletedCount++;
-            }
-          });
+      if (biwStatus) {
+        const bsLower = String(biwStatus).toLowerCase();
+        if (
+          bsLower.includes('accept') ||
+          bsLower.includes('direct ok') ||
+          bsLower.includes('ok') ||
+          bsLower === 'verified'
+        ) {
+          stats.biwAccepted++;
+          stats.accepted++;
+          stats.biwTotalReviewed++;
+          stats.totalReviewed++;
+        } else if (bsLower.includes('reject')) {
+          stats.biwRejected++;
+          stats.rejectedReview++;
+          stats.biwTotalReviewed++;
+          stats.totalReviewed++;
+        } else if (bsLower.includes('rework')) {
+          stats.biwReworked++;
+          stats.reworked++;
+          stats.biwTotalReviewed++;
+          stats.totalReviewed++;
         }
-        stats.reworkQcCompleted = reworkCompletedCount;
+      }
+
+      // 2. TVS Review outcomes (from Review collection or response.tvsReview / response.review)
+      const tvsReview = reviewsByResponseId.get(rId1) || reviewsByResponseId.get(rId2) || response.tvsReview || response.review;
+      const tvsStatus = tvsReview?.reviewOption || tvsReview?.status;
+
+      if (tvsStatus) {
+        const tsLower = String(tvsStatus).toLowerCase();
+        if (
+          tsLower.includes('accept') ||
+          tsLower.includes('direct ok') ||
+          tsLower.includes('ok') ||
+          tsLower === 'verified'
+        ) {
+          stats.tvsAccepted++;
+          stats.tvsTotalReviewed++;
+        } else if (tsLower.includes('reject')) {
+          stats.tvsRejected++;
+          stats.tvsTotalReviewed++;
+        } else if (tsLower.includes('rework')) {
+          stats.tvsReworked++;
+          stats.tvsTotalReviewed++;
+        }
+      }
+    });
+
+    // Build lookup from inspector DB aggregation
+    const aggMap = new Map();
+    (aggregatedInspectors || []).forEach(ai => {
+      const nameKey = (ai._id || '').trim();
+      if (nameKey) {
+        aggMap.set(nameKey, ai);
+        aggMap.set(nameKey.toLowerCase(), ai);
+      }
+    });
+
+    // Calculate final metrics strictly reconciled with DB aggregation truth
+    for (const [userId, stats] of userStatsMap) {
+      const matchAgg = aggMap.get(stats.userName) || aggMap.get((stats.userName || '').toLowerCase());
+      if (matchAgg) {
+        stats.totalSubmitted = matchAgg.totalSubmitted || stats.totalSubmitted;
+        stats.defectCount = matchAgg.defectCount || 0;
+        stats.directOk = Math.max(0, stats.totalSubmitted - stats.defectCount);
+        stats.reworkQcPending = stats.defectCount;
+        stats.reworkQcCompleted = matchAgg.reworkAcceptedCount || 0;
+        stats.rejected = matchAgg.rejectedCount || 0;
+        stats.dispatched = matchAgg.dispatched !== undefined ? matchAgg.dispatched : (stats.dispatched || 0);
+        stats.dispatchPending = Math.max(0, stats.directOk + stats.reworkQcCompleted - stats.dispatched);
+        stats.biwTotalReviewed = matchAgg.biwTotalReviewed !== undefined ? matchAgg.biwTotalReviewed : (stats.biwTotalReviewed || 0);
+        stats.biwAccepted = matchAgg.biwAccepted !== undefined ? matchAgg.biwAccepted : (stats.biwAccepted || 0);
+        stats.biwRejected = matchAgg.biwRejected !== undefined ? matchAgg.biwRejected : (stats.biwRejected || 0);
+        stats.biwReworked = matchAgg.biwReworked !== undefined ? matchAgg.biwReworked : (stats.biwReworked || 0);
+        stats.tvsTotalReviewed = matchAgg.tvsTotalReviewed !== undefined ? matchAgg.tvsTotalReviewed : (stats.tvsTotalReviewed || 0);
+        stats.tvsAccepted = matchAgg.tvsAccepted !== undefined ? matchAgg.tvsAccepted : (stats.tvsAccepted || 0);
+        stats.tvsRejected = matchAgg.tvsRejected !== undefined ? matchAgg.tvsRejected : (stats.tvsRejected || 0);
+        stats.tvsReworked = matchAgg.tvsReworked !== undefined ? matchAgg.tvsReworked : (stats.tvsReworked || 0);
+      } else {
+        stats.dispatchPending = Math.max(0, stats.directOk + stats.reworkQcCompleted - stats.dispatched);
+      }
+
+      stats.biwReviewPending = Math.max(0, stats.totalSubmitted - stats.biwTotalReviewed);
+      stats.reviewPending = stats.biwReviewPending;
+      stats.tvsReviewPending = Math.max(0, stats.totalSubmitted - stats.tvsTotalReviewed);
+
+      const totalReviewed = stats.biwTotalReviewed + stats.tvsTotalReviewed;
+      const totalAccepted = stats.biwAccepted + stats.tvsAccepted;
+
+      if (totalReviewed > 0) {
+        stats.performanceScore = Math.round((totalAccepted / totalReviewed) * 100);
+      } else if (stats.totalSubmitted > 0) {
+        const defects = stats.reworkQcPending + stats.rejected;
+        stats.performanceScore = Math.round((Math.max(0, stats.totalSubmitted - defects) / stats.totalSubmitted) * 100);
+      } else {
+        stats.performanceScore = 0;
+      }
+    }
+
+    // Add any submitters from aggregatedInspectors not yet in userStatsMap
+    for (const ai of (aggregatedInspectors || [])) {
+      const nameKey = (ai._id || '').trim();
+      if (!nameKey || nameKey.toLowerCase() === 'unknown submitter') continue;
+      const lower = nameKey.toLowerCase();
+      const existing = Array.from(userStatsMap.values()).find(s => (s.userName || '').toLowerCase() === lower);
+      if (!existing && ai.totalSubmitted > 0) {
+        const u = users.find(u => `${u.firstName || ''} ${u.lastName || ''}`.trim().toLowerCase() === lower || u.username?.toLowerCase() === lower);
+        const sampleResp = allResponses.find(r => (r.submittedBy || '').trim().toLowerCase() === lower);
+        const respTId = sampleResp?.tenantId?.toString() || (sampleResp?.questionId && formTenantMap.get(sampleResp.questionId.toString()));
+        const uTId = u?.tenantId?._id?.toString() || u?.tenantId?.toString() || respTId;
+        const tenantName = (uTId && tenantNameMap.get(uTId)) || u?.tenantId?.companyName || u?.tenantId?.name || 'Unknown Plant';
+        const dOk = Math.max(0, ai.totalSubmitted - (ai.defectCount || 0));
+        const disp = ai.dispatched || 0;
+        const totalRev = (ai.biwTotalReviewed || 0) + (ai.tvsTotalReviewed || 0);
+        const totalAcc = (ai.biwAccepted || 0) + (ai.tvsAccepted || 0);
+        const pScore = totalRev > 0 ? Math.round((totalAcc / totalRev) * 100) : (ai.totalSubmitted > 0 ? Math.round((dOk / ai.totalSubmitted) * 100) : 0);
+
+        userStatsMap.set(`insp_${nameKey}`, {
+          userId: u?._id?.toString() || `insp_${nameKey}`,
+          userName: nameKey,
+          userEmail: u?.email || '',
+          userRole: u?.role || 'inspector',
+          tenantName: tenantName,
+          totalSubmitted: ai.totalSubmitted,
+          directOk: dOk,
+          reworkQcPending: ai.defectCount || 0,
+          reworkQcCompleted: ai.reworkAcceptedCount || 0,
+          rejected: ai.rejectedCount || 0,
+          dispatched: disp,
+          dispatchPending: Math.max(0, dOk + (ai.reworkAcceptedCount || 0) - disp),
+          biwTotalReviewed: ai.biwTotalReviewed || 0,
+          biwAccepted: ai.biwAccepted || 0,
+          biwRejected: ai.biwRejected || 0,
+          biwReworked: ai.biwReworked || 0,
+          biwReviewPending: Math.max(0, ai.totalSubmitted - (ai.biwTotalReviewed || 0)),
+          reviewPending: Math.max(0, ai.totalSubmitted - (ai.biwTotalReviewed || 0)),
+          tvsTotalReviewed: ai.tvsTotalReviewed || 0,
+          tvsAccepted: ai.tvsAccepted || 0,
+          tvsRejected: ai.tvsRejected || 0,
+          tvsReworked: ai.tvsReworked || 0,
+          tvsReviewPending: Math.max(0, ai.totalSubmitted - (ai.tvsTotalReviewed || 0)),
+          performanceScore: pScore,
+          responses: []
+        });
       }
     }
 
     // Format final table data
+    const formTenantId = formDoc?.tenantId ? formDoc.tenantId.toString() : (userTenantId ? userTenantId.toString() : null);
     const tableData = Array.from(userStatsMap.values())
       .filter(stats => stats.totalSubmitted > 0 || stats.totalReviewed > 0)
       .map(stats => {
@@ -2969,13 +3479,13 @@ export const getPerformanceTable = async (req, res) => {
         let displayName = stats.userName;
         let displayEmail = stats.userEmail;
         let displayRole = stats.userRole;
-        let tenantName = stats.tenantName || 'Cross-Tenant User';
+        // Keep stats.tenantName as the plant where inspections were performed
+        let tenantName = stats.tenantName || (user ? (user.tenantId?.name || user.tenantId?.companyName) : 'Cross-Tenant User');
 
         if (user) {
           displayName = `${user.firstName} ${user.lastName}`;
           displayEmail = user.email || '';
           displayRole = user.role || 'inspector';
-          tenantName = user.tenantId?.name || user.tenantId?.companyName || 'Cross-Tenant User';
         } else if (/^[0-9a-f]{24}$/i.test(stats.userId)) {
           displayName = `User ${stats.userId.substring(0, 8)}`;
         }
@@ -2995,11 +3505,28 @@ export const getPerformanceTable = async (req, res) => {
           dispatchPending: stats.dispatchPending || 0,
           dispatched: stats.dispatched || 0,
           totalSubmitted: stats.totalSubmitted || 0,
-          totalReviewed: stats.totalReviewed || 0,
-          reviewPending: stats.reviewPending || 0,
-          accepted: stats.accepted || 0,
-          rejectedReview: stats.rejectedReview || 0,
-          reworked: stats.reworked || 0,
+
+          // BIW Review
+          biwTotalReviewed: stats.biwTotalReviewed || 0,
+          biwReviewPending: stats.biwReviewPending || 0,
+          biwAccepted: stats.biwAccepted || 0,
+          biwRejected: stats.biwRejected || 0,
+          biwReworked: stats.biwReworked || 0,
+
+          // Backward compatibility aliases
+          totalReviewed: stats.biwTotalReviewed || 0,
+          reviewPending: stats.biwReviewPending || 0,
+          accepted: stats.biwAccepted || 0,
+          rejectedReview: stats.biwRejected || 0,
+          reworked: stats.biwReworked || 0,
+
+          // TVS Review
+          tvsTotalReviewed: stats.tvsTotalReviewed || 0,
+          tvsReviewPending: stats.tvsReviewPending || 0,
+          tvsAccepted: stats.tvsAccepted || 0,
+          tvsRejected: stats.tvsRejected || 0,
+          tvsReworked: stats.tvsReworked || 0,
+
           performanceScore: stats.performanceScore || 0
         };
       });
@@ -3011,6 +3538,8 @@ export const getPerformanceTable = async (req, res) => {
       totalSubmissions: tableData.reduce((sum, row) => sum + row.totalSubmitted, 0),
       totalDispatched: tableData.reduce((sum, row) => sum + row.dispatched, 0),
       totalReviewed: tableData.reduce((sum, row) => sum + row.totalReviewed, 0),
+      totalBiwReviewed: tableData.reduce((sum, row) => sum + row.biwTotalReviewed, 0),
+      totalTvsReviewed: tableData.reduce((sum, row) => sum + row.tvsTotalReviewed, 0),
       averageScore: tableData.length > 0
         ? Math.round(tableData.reduce((sum, row) => sum + row.performanceScore, 0) / tableData.length)
         : 0,
@@ -3371,17 +3900,46 @@ export const getOverallAnalytics = async (req, res) => {
 export const getQualitySummary = async (req, res) => {
   try {
     const startTimer = Date.now();
-    const { formId, startDate, endDate, tenantId: queryTenantId } = req.query;
+    const { formId, formIds, startDate, endDate, tenantId: queryTenantId } = req.query;
     const { role, tenantId: userTenantId } = req.user;
 
-    // ─── Cache check (3 minute TTL) ─────────────────────────────────────
-    const cacheKey = `quality_summary_v7_${userTenantId || 'superadmin'}_${formId || 'all'}_${startDate || ''}_${endDate || ''}_${queryTenantId || ''}`;
-    const cached = appCache.get(cacheKey);
-    if (cached) {
-      console.log(`[Quality Summary] Cache HIT (${cacheKey}) - returning in ${Date.now() - startTimer}ms`);
-      return res.json(cached);
+    // Parse date objects safely once at function level (normalized to full day UTC boundaries)
+    let startObj = null;
+    let endObj = null;
+    if (startDate) {
+      const datePart = typeof startDate === 'string' && startDate.includes('T') ? startDate.split('T')[0] : startDate;
+      startObj = new Date(`${datePart}T00:00:00.000Z`);
+      if (isNaN(startObj.getTime())) startObj = null;
     }
-    console.log(`[Quality Summary] Cache MISS (${cacheKey}) - computing from DB...`);
+    if (endDate) {
+      const datePart = typeof endDate === 'string' && endDate.includes('T') ? endDate.split('T')[0] : endDate;
+      endObj = new Date(`${datePart}T23:59:59.999Z`);
+      if (isNaN(endObj.getTime())) endObj = null;
+    }
+
+    // Parse formIds (can be an array, comma-separated string, or single formId)
+    const rawFormInput = formIds || formId;
+    let selectedFormIdList = [];
+    if (rawFormInput && rawFormInput !== 'all') {
+      if (Array.isArray(rawFormInput)) {
+        selectedFormIdList = rawFormInput.flatMap(id => String(id).split(',')).map(s => s.trim()).filter(Boolean);
+      } else if (typeof rawFormInput === 'string') {
+        selectedFormIdList = rawFormInput.split(',').map(s => s.trim()).filter(Boolean);
+      }
+    }
+
+    // ─── Cache check (3 minute TTL) ─────────────────────────────────────
+    const formKeyForCache = selectedFormIdList.length > 0 ? [...selectedFormIdList].sort().join(',') : 'all';
+    const cacheKey = `quality_summary_v28_${userTenantId || 'superadmin'}_${formKeyForCache}_${startDate || ''}_${endDate || ''}_${queryTenantId || ''}`;
+    const shouldBypassCache = req.query.forceNetwork === 'true' || req.query.bypassCache === 'true' || req.headers?.['cache-control'] === 'no-cache';
+    if (!shouldBypassCache) {
+      const cached = appCache.get(cacheKey);
+      if (cached) {
+        console.log(`[Quality Summary] Cache HIT (${cacheKey}) - returning in ${Date.now() - startTimer}ms`);
+        return res.json(cached);
+      }
+    }
+    console.log(`[Quality Summary] Cache MISS or Bypassed (${cacheKey}) - computing from DB...`);
 
     // 1. Identify target tenant
     let targetTenantId = userTenantId;
@@ -3389,89 +3947,175 @@ export const getQualitySummary = async (req, res) => {
       targetTenantId = queryTenantId;
     }
 
-    // 2. Fetch accessible forms
-    const formQuery = {};
-    if (role === 'superadmin' && !queryTenantId) {
-      // Superadmin sees all forms
-    } else if (targetTenantId) {
-      const tIdObj = mongoose.Types.ObjectId.isValid(targetTenantId)
-        ? new mongoose.Types.ObjectId(targetTenantId)
-        : targetTenantId;
+    // 2. Fetch accessible forms (cached in memory for 5 minutes)
+    const formsMetaCacheKey = `forms_meta_v22_${targetTenantId || 'all'}`;
+    let formsMeta = appCache.get(formsMetaCacheKey);
 
-      formQuery.$or = [
-        { tenantId: tIdObj },
-        { tenantId: targetTenantId.toString() },
-        { isGlobal: true },
-        { sharedWithTenants: targetTenantId.toString() },
-        { sharedWithTenants: tIdObj },
-        { 'chassisTenantAssignments.assignedTenants': targetTenantId.toString() }
-      ];
-    }
+    if (!formsMeta || shouldBypassCache) {
+      const formQuery = {};
+      if (role === 'superadmin' && !queryTenantId) {
+        // Superadmin sees all forms
+      } else if (targetTenantId) {
+        const tIdObj = mongoose.Types.ObjectId.isValid(targetTenantId)
+          ? new mongoose.Types.ObjectId(targetTenantId)
+          : targetTenantId;
 
-    const accessibleForms = await Form.find(formQuery)
-      .select('id _id title sections tenantId')
-      .lean();
+        formQuery.$or = [
+          { tenantId: tIdObj },
+          { tenantId: targetTenantId.toString() },
+          { isGlobal: true },
+          { sharedWithTenants: targetTenantId.toString() },
+          { sharedWithTenants: tIdObj },
+          { 'chassisTenantAssignments.assignedTenants': targetTenantId.toString() }
+        ];
+      }
 
-    const formTitleMap = {};
-    const formChassisQuestionMap = {};
-    const questionTitleMap = {};
-    const questionMetaMap = {};
+      // 1. Fetch base forms directly accessible to tenant
+      const baseForms = await Form.find(formQuery)
+        .select('id _id title sections tenantId childForms parentFormId parentFormTitle isChildForm')
+        .lean();
 
-    accessibleForms.forEach(f => {
-      const idStr = f.id ? f.id.toString() : '';
-      const mongoIdStr = f._id ? f._id.toString() : '';
-      if (idStr) formTitleMap[idStr] = f.title;
-      if (mongoIdStr) formTitleMap[mongoIdStr] = f.title;
+      // 2. Collect all linked child form IDs & parent form IDs
+      const linkedChildIds = [];
+      const accessibleParentIds = [];
+      baseForms.forEach(f => {
+        const fIds = [f.id, f._id ? f._id.toString() : ''].filter(Boolean);
+        accessibleParentIds.push(...fIds);
+        (f.childForms || []).forEach(cf => {
+          const cfId = typeof cf === 'string' ? cf : (cf.formId || cf.id || cf._id);
+          if (cfId) linkedChildIds.push(cfId.toString());
+        });
+        if (f.parentFormId) {
+          linkedChildIds.push(f.parentFormId.toString());
+        }
+      });
 
-      const fIds = [idStr, mongoIdStr].filter(Boolean);
-      let primaryChassisQId = null;
+      let additionalChildForms = [];
+      const additionalObjIds = linkedChildIds
+        .filter(id => mongoose.Types.ObjectId.isValid(id))
+        .map(id => new mongoose.Types.ObjectId(id));
+      const parentObjIds = accessibleParentIds
+        .filter(id => mongoose.Types.ObjectId.isValid(id))
+        .map(id => new mongoose.Types.ObjectId(id));
 
-      (f.sections || []).forEach(sec => {
-        (sec.questions || []).forEach(q => {
-          if (!q.id) return;
-          const qText = (q.text || '').trim();
-          const qTextLow = qText.toLowerCase();
-          const qType = q.type || '';
+      if (linkedChildIds.length > 0 || accessibleParentIds.length > 0) {
+        const extraQuery = {
+          $or: [
+            ...(linkedChildIds.length > 0 ? [
+              { _id: { $in: additionalObjIds } },
+              { id: { $in: linkedChildIds } }
+            ] : []),
+            ...(accessibleParentIds.length > 0 ? [
+              { parentFormId: { $in: [...accessibleParentIds, ...parentObjIds] } },
+              { 'childForms.formId': { $in: accessibleParentIds } }
+            ] : [])
+          ]
+        };
+        additionalChildForms = await Form.find(extraQuery)
+          .select('id _id title sections tenantId childForms parentFormId parentFormTitle isChildForm')
+          .lean();
+      }
 
-          questionTitleMap[q.id] = qText;
-          questionMetaMap[q.id] = { text: qText, type: qType, formId: idStr || mongoIdStr };
+      const formMapById = new Map();
+      baseForms.forEach(f => formMapById.set(f._id.toString(), f));
+      additionalChildForms.forEach(f => formMapById.set(f._id.toString(), f));
+      const accessibleForms = Array.from(formMapById.values());
 
-          if (!primaryChassisQId) {
-            if (
-              qType === 'chassis' ||
-              qType === 'chassisWithZone' ||
-              qType === 'chassisWithoutZone' ||
-              qTextLow === 'chassis number' ||
-              qTextLow === 'identification number' ||
-              qTextLow === 'id number' ||
-              qTextLow === 'chassis' ||
-              qTextLow === 'chassis / vin' ||
-              qTextLow.includes('chassis number') ||
-              qTextLow.includes('identification number') ||
-              qTextLow.includes('id number') ||
-              qTextLow.includes('registration number')
-            ) {
-              primaryChassisQId = q.id;
+      const formTitleMap = {};
+      const formChassisQuestionMap = {};
+      const questionTitleMap = {};
+      const questionMetaMap = {};
+
+      accessibleForms.forEach(f => {
+        const idStr = f.id ? f.id.toString() : '';
+        const mongoIdStr = f._id ? f._id.toString() : '';
+        if (idStr) formTitleMap[idStr] = f.title;
+        if (mongoIdStr) formTitleMap[mongoIdStr] = f.title;
+
+        const fIds = [idStr, mongoIdStr].filter(Boolean);
+        let primaryChassisQId = null;
+
+        (f.sections || []).forEach(sec => {
+          (sec.questions || []).forEach(q => {
+            if (!q.id) return;
+            const qText = (q.text || '').trim();
+            const qTextLow = qText.toLowerCase();
+            const qType = q.type || '';
+
+            questionTitleMap[q.id] = qText;
+            questionMetaMap[q.id] = { text: qText, type: qType, formId: idStr || mongoIdStr };
+
+            if (!primaryChassisQId) {
+              if (
+                qType === 'chassis' ||
+                qType === 'chassisWithZone' ||
+                qType === 'chassisWithoutZone' ||
+                qTextLow === 'chassis number' ||
+                qTextLow === 'identification number' ||
+                qTextLow === 'id number' ||
+                qTextLow === 'chassis' ||
+                qTextLow === 'chassis / vin' ||
+                qTextLow.includes('chassis number') ||
+                qTextLow.includes('identification number') ||
+                qTextLow.includes('id number') ||
+                qTextLow.includes('registration number')
+              ) {
+                primaryChassisQId = q.id;
+              }
             }
-          }
+          });
+        });
+
+        fIds.forEach(fid => {
+          formChassisQuestionMap[fid] = { primaryChassisQId };
         });
       });
 
-      fIds.forEach(fid => {
-        formChassisQuestionMap[fid] = { primaryChassisQId };
+      formsMeta = {
+        accessibleForms,
+        formTitleMap,
+        formChassisQuestionMap,
+        questionTitleMap,
+        questionMetaMap
+      };
+      appCache.set(formsMetaCacheKey, formsMeta, 300); // 5 min TTL
+    }
+
+    const {
+      accessibleForms,
+      formTitleMap,
+      formChassisQuestionMap,
+      questionTitleMap,
+      questionMetaMap
+    } = formsMeta;
+
+    // 2b. Compute or retrieve master inspection counts for all accessible forms (cached 5 min)
+    const masterCountsKey = `master_form_counts_v22_${userTenantId || 'superadmin'}`;
+    let masterFormCounts = appCache.get(masterCountsKey);
+
+    if (!masterFormCounts) {
+      const allAccessibleKeys = accessibleForms.flatMap(f => [f.id, f._id?.toString()]).filter(Boolean);
+      const countAgg = await Response.aggregate([
+        { $match: { questionId: { $in: allAccessibleKeys }, isSectionSubmit: { $ne: true } } },
+        { $group: { _id: '$questionId', count: { $sum: 1 } } }
+      ]);
+      masterFormCounts = {};
+      countAgg.forEach(c => {
+        if (c._id) masterFormCounts[c._id.toString()] = c.count;
       });
-    });
+      appCache.set(masterCountsKey, masterFormCounts, 300); // 5 min TTL
+    }
 
     // 3. Build response filter
     let formKeys = [];
-    if (formId && formId !== 'all') {
-      const selectedForm = accessibleForms.find(
-        f => f.id === formId || f._id.toString() === formId
+    if (selectedFormIdList.length > 0) {
+      const matchedForms = accessibleForms.filter(
+        f => selectedFormIdList.includes(f.id) || selectedFormIdList.includes(f._id.toString())
       );
-      if (selectedForm) {
-        formKeys = [selectedForm.id, selectedForm._id?.toString()].filter(Boolean);
+      if (matchedForms.length > 0) {
+        formKeys = matchedForms.flatMap(f => [f.id, f._id?.toString()]).filter(Boolean);
       } else {
-        formKeys = [formId];
+        formKeys = selectedFormIdList;
       }
     } else {
       formKeys = accessibleForms.flatMap(f => [f.id, f._id?.toString()]).filter(Boolean);
@@ -3482,15 +4126,30 @@ export const getQualitySummary = async (req, res) => {
       isSectionSubmit: { $ne: true }
     };
 
-    if (startDate || endDate) {
-      responseFilter.createdAt = {};
-      if (startDate) responseFilter.createdAt.$gte = new Date(startDate);
-      if (endDate) {
-        const end = new Date(endDate);
-        end.setHours(23, 59, 59, 999);
-        responseFilter.createdAt.$lte = end;
-      }
+    // Guard: if no accessible forms found, return empty summary immediately
+    if (formKeys.length === 0) {
+      console.log(`[Quality Summary] No accessible forms found for tenant ${targetTenantId} - returning empty summary`);
+      const emptyPayload = {
+        success: true,
+        data: {
+          totalChecked: 0, totalAccepted: 0, totalDefects: 0, overallAcceptRate: 0, overallDefectRate: 0,
+          totalRework1: 0, reworkAcceptedCount: 0, rejectedCount: 0, directOkCount: 0,
+          totalDispatched: 0, pendingDispatch: 0, totalBiwReviewed: 0, biwAcceptCount: 0, biwRejectCount: 0,
+          tvsReviewedCount: 0, tvsAcceptCount: 0, tvsRejectCount: 0, tvsReworkCount: 0, pendingTvsReview: 0,
+          totalForms: 0, formBreakdown: [], inspectors: [], defectBreakdown: [], dailyTrends: [], rawResponses: []
+        }
+      };
+      appCache.set(cacheKey, emptyPayload, 60);
+      return res.json(emptyPayload);
     }
+
+    if (startObj || endObj) {
+      responseFilter.createdAt = {};
+      if (startObj) responseFilter.createdAt.$gte = startObj;
+      if (endObj) responseFilter.createdAt.$lte = endObj;
+    }
+
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
 
     // 4. Ultra-fast MongoDB Aggregation Pipeline (computed directly in DB engine)
     const pipeline = [
@@ -3502,13 +4161,112 @@ export const getQualitySummary = async (req, res) => {
               $group: {
                 _id: null,
                 totalChecked: { $sum: 1 },
+                total30Count: {
+                  $sum: { $cond: [{ $gte: ['$createdAt', thirtyDaysAgo] }, 1, 0] }
+                },
+                dispatched30Count: {
+                  $sum: {
+                    $cond: [
+                      {
+                        $and: [
+                          { $gte: ['$createdAt', thirtyDaysAgo] },
+                          {
+                            $or: [
+                              { $eq: ['$isDispatched', true] },
+                              { $and: [{ $ne: ['$dispatchedAt', null] }, { $gt: ['$dispatchedAt', ''] }] }
+                            ]
+                          }
+                        ]
+                      },
+                      1,
+                      0
+                    ]
+                  }
+                },
+                defect30Count: {
+                  $sum: {
+                    $cond: [
+                      {
+                        $and: [
+                          { $gte: ['$createdAt', thirtyDaysAgo] },
+                          {
+                            $or: [
+                              { $in: ['$biwReview.status', ['Rejected', 'Reworked']] },
+                              { $in: ['$review.status', ['Rejected', 'Rework', 'Reworked']] },
+                              { $in: ['$review.reviewOption', ['Rejected', 'Rework', 'Reworked']] },
+                              { $regexMatch: { input: { $toLower: { $ifNull: ['$status', ''] } }, regex: 'rework|rejected|defect|fail' } },
+                              {
+                                $anyElementTrue: {
+                                  $map: {
+                                    input: { $objectToArray: { $ifNull: ['$answers', {}] } },
+                                    as: 'ans',
+                                    in: {
+                                      $regexMatch: {
+                                        input: {
+                                          $toLower: {
+                                            $ifNull: [
+                                              '$$ans.v.status',
+                                              {
+                                                $cond: [
+                                                  { $eq: [{ $type: '$$ans.v' }, 'string'] },
+                                                  '$$ans.v',
+                                                  ''
+                                                ]
+                                              }
+                                            ]
+                                          }
+                                        },
+                                        regex: 'rework|rejected|defect|fail|not ok'
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            ]
+                          }
+                        ]
+                      },
+                      1,
+                      0
+                    ]
+                  }
+                },
                 defectCount: {
                   $sum: {
                     $cond: [
                       {
                         $or: [
                           { $in: ['$biwReview.status', ['Rejected', 'Reworked']] },
-                          { $regexMatch: { input: { $toLower: { $ifNull: ['$status', ''] } }, regex: 'rework|rejected|defect|fail' } }
+                          { $in: ['$review.status', ['Rejected', 'Rework', 'Reworked']] },
+                          { $in: ['$review.reviewOption', ['Rejected', 'Rework', 'Reworked']] },
+                          { $regexMatch: { input: { $toLower: { $ifNull: ['$status', ''] } }, regex: 'rework|rejected|defect|fail' } },
+                          {
+                            $anyElementTrue: {
+                              $map: {
+                                input: { $objectToArray: { $ifNull: ['$answers', {}] } },
+                                as: 'ans',
+                                in: {
+                                  $regexMatch: {
+                                    input: {
+                                      $toLower: {
+                                        $ifNull: [
+                                          '$$ans.v.status',
+                                          {
+                                            $cond: [
+                                              { $eq: [{ $type: '$$ans.v' }, 'string'] },
+                                              '$$ans.v',
+                                              ''
+                                            ]
+                                          }
+                                        ]
+                                      }
+                                    },
+                                    regex: 'rework|rejected|defect|fail|not ok'
+                                  }
+                                }
+                              }
+                            }
+                          }
                         ]
                       },
                       1,
@@ -3519,7 +4277,101 @@ export const getQualitySummary = async (req, res) => {
                 rework1Count: {
                   $sum: {
                     $cond: [
-                      { $regexMatch: { input: { $toLower: { $ifNull: ['$status', ''] } }, regex: 'rework 1' } },
+                      {
+                        $or: [
+                          { $eq: ['$biwReview.status', 'Reworked'] },
+                          { $in: ['$review.status', ['Rework', 'Reworked']] },
+                          { $in: ['$review.reviewOption', ['Rework', 'Reworked']] },
+                          { $regexMatch: { input: { $toLower: { $ifNull: ['$status', ''] } }, regex: 'rework' } }
+                        ]
+                      },
+                      1,
+                      0
+                    ]
+                  }
+                },
+                reworkAcceptedCount: {
+                  $sum: {
+                    $cond: [
+                      { $regexMatch: { input: { $toLower: { $ifNull: ['$status', ''] } }, regex: 'rework accept|rework complete' } },
+                      1,
+                      0
+                    ]
+                  }
+                },
+                rejectedCount: {
+                  $sum: {
+                    $cond: [
+                      {
+                        $or: [
+                          { $eq: ['$biwReview.status', 'Rejected'] },
+                          { $eq: ['$review.status', 'Rejected'] },
+                          { $eq: ['$review.reviewOption', 'Rejected'] },
+                          { $regexMatch: { input: { $toLower: { $ifNull: ['$status', ''] } }, regex: 'reject' } }
+                        ]
+                      },
+                      1,
+                      0
+                    ]
+                  }
+                },
+                dispatchedCount: {
+                  $sum: {
+                    $cond: [
+                      {
+                        $or: [
+                          { $eq: ['$isDispatched', true] },
+                          { $and: [{ $ne: ['$dispatchedAt', null] }, { $gt: ['$dispatchedAt', ''] }] }
+                        ]
+                      },
+                      1,
+                      0
+                    ]
+                  }
+                },
+                biwAcceptCount: {
+                  $sum: { $cond: [{ $eq: ['$biwReview.status', 'Accepted'] }, 1, 0] }
+                },
+                biwRejectCount: {
+                  $sum: { $cond: [{ $eq: ['$biwReview.status', 'Rejected'] }, 1, 0] }
+                },
+                biwDefectCount: {
+                  $sum: { $cond: [{ $in: ['$biwReview.status', ['Rejected', 'Reworked']] }, 1, 0] }
+                },
+                biwReviewedCount: {
+                  $sum: { $cond: [{ $in: ['$biwReview.status', ['Accepted', 'Rejected', 'Reworked']] }, 1, 0] }
+                },
+                tvsAcceptCount: {
+                  $sum: {
+                    $cond: [
+                      { $or: [{ $eq: ['$review.status', 'Accepted'] }, { $eq: ['$review.reviewOption', 'Accepted'] }] },
+                      1,
+                      0
+                    ]
+                  }
+                },
+                tvsRejectCount: {
+                  $sum: {
+                    $cond: [
+                      { $or: [{ $eq: ['$review.status', 'Rejected'] }, { $eq: ['$review.reviewOption', 'Rejected'] }] },
+                      1,
+                      0
+                    ]
+                  }
+                },
+                tvsReworkCount: {
+                  $sum: {
+                    $cond: [
+                      { $or: [{ $in: ['$review.status', ['Rework', 'Reworked']] }, { $in: ['$review.reviewOption', ['Rework', 'Reworked']] }] },
+                      1,
+                      0
+                    ]
+                  }
+                },
+                tvsReviewedCount: {
+                  $sum: {
+                    $cond: [
+                      { $or: [{ $in: ['$review.status', ['Accepted', 'Rejected', 'Rework', 'Reworked']] }, { $in: ['$review.reviewOption', ['Accepted', 'Rejected', 'Rework', 'Reworked']] }] },
                       1,
                       0
                     ]
@@ -3533,13 +4385,112 @@ export const getQualitySummary = async (req, res) => {
               $group: {
                 _id: '$questionId',
                 totalChecked: { $sum: 1 },
+                total30Count: {
+                  $sum: { $cond: [{ $gte: ['$createdAt', thirtyDaysAgo] }, 1, 0] }
+                },
+                dispatched30Count: {
+                  $sum: {
+                    $cond: [
+                      {
+                        $and: [
+                          { $gte: ['$createdAt', thirtyDaysAgo] },
+                          {
+                            $or: [
+                              { $eq: ['$isDispatched', true] },
+                              { $and: [{ $ne: ['$dispatchedAt', null] }, { $gt: ['$dispatchedAt', ''] }] }
+                            ]
+                          }
+                        ]
+                      },
+                      1,
+                      0
+                    ]
+                  }
+                },
+                defect30Count: {
+                  $sum: {
+                    $cond: [
+                      {
+                        $and: [
+                          { $gte: ['$createdAt', thirtyDaysAgo] },
+                          {
+                            $or: [
+                              { $in: ['$biwReview.status', ['Rejected', 'Reworked']] },
+                              { $in: ['$review.status', ['Rejected', 'Rework', 'Reworked']] },
+                              { $in: ['$review.reviewOption', ['Rejected', 'Rework', 'Reworked']] },
+                              { $regexMatch: { input: { $toLower: { $ifNull: ['$status', ''] } }, regex: 'rework|rejected|defect|fail' } },
+                              {
+                                $anyElementTrue: {
+                                  $map: {
+                                    input: { $objectToArray: { $ifNull: ['$answers', {}] } },
+                                    as: 'ans',
+                                    in: {
+                                      $regexMatch: {
+                                        input: {
+                                          $toLower: {
+                                            $ifNull: [
+                                              '$$ans.v.status',
+                                              {
+                                                $cond: [
+                                                  { $eq: [{ $type: '$$ans.v' }, 'string'] },
+                                                  '$$ans.v',
+                                                  ''
+                                                ]
+                                              }
+                                            ]
+                                          }
+                                        },
+                                        regex: 'rework|rejected|defect|fail|not ok'
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            ]
+                          }
+                        ]
+                      },
+                      1,
+                      0
+                    ]
+                  }
+                },
                 defectCount: {
                   $sum: {
                     $cond: [
                       {
                         $or: [
                           { $in: ['$biwReview.status', ['Rejected', 'Reworked']] },
-                          { $regexMatch: { input: { $toLower: { $ifNull: ['$status', ''] } }, regex: 'rework|rejected|defect|fail' } }
+                          { $in: ['$review.status', ['Rejected', 'Rework', 'Reworked']] },
+                          { $in: ['$review.reviewOption', ['Rejected', 'Rework', 'Reworked']] },
+                          { $regexMatch: { input: { $toLower: { $ifNull: ['$status', ''] } }, regex: 'rework|rejected|defect|fail' } },
+                          {
+                            $anyElementTrue: {
+                              $map: {
+                                input: { $objectToArray: { $ifNull: ['$answers', {}] } },
+                                as: 'ans',
+                                in: {
+                                  $regexMatch: {
+                                    input: {
+                                      $toLower: {
+                                        $ifNull: [
+                                          '$$ans.v.status',
+                                          {
+                                            $cond: [
+                                              { $eq: [{ $type: '$$ans.v' }, 'string'] },
+                                              '$$ans.v',
+                                              ''
+                                            ]
+                                          }
+                                        ]
+                                      }
+                                    },
+                                    regex: 'rework|rejected|defect|fail|not ok'
+                                  }
+                                }
+                              }
+                            }
+                          }
                         ]
                       },
                       1,
@@ -3550,25 +4501,101 @@ export const getQualitySummary = async (req, res) => {
                 rework1Count: {
                   $sum: {
                     $cond: [
-                      { $regexMatch: { input: { $toLower: { $ifNull: ['$status', ''] } }, regex: 'rework 1' } },
+                      {
+                        $or: [
+                          { $eq: ['$biwReview.status', 'Reworked'] },
+                          { $in: ['$review.status', ['Rework', 'Reworked']] },
+                          { $in: ['$review.reviewOption', ['Rework', 'Reworked']] },
+                          { $regexMatch: { input: { $toLower: { $ifNull: ['$status', ''] } }, regex: 'rework' } }
+                        ]
+                      },
+                      1,
+                      0
+                    ]
+                  }
+                },
+                reworkAcceptedCount: {
+                  $sum: {
+                    $cond: [
+                      { $regexMatch: { input: { $toLower: { $ifNull: ['$status', ''] } }, regex: 'rework accept|rework complete' } },
+                      1,
+                      0
+                    ]
+                  }
+                },
+                rejectedCount: {
+                  $sum: {
+                    $cond: [
+                      {
+                        $or: [
+                          { $eq: ['$biwReview.status', 'Rejected'] },
+                          { $eq: ['$review.status', 'Rejected'] },
+                          { $eq: ['$review.reviewOption', 'Rejected'] },
+                          { $regexMatch: { input: { $toLower: { $ifNull: ['$status', ''] } }, regex: 'reject' } }
+                        ]
+                      },
                       1,
                       0
                     ]
                   }
                 },
                 biwAcceptCount: {
+                  $sum: { $cond: [{ $eq: ['$biwReview.status', 'Accepted'] }, 1, 0] }
+                },
+                biwRejectCount: {
+                  $sum: { $cond: [{ $eq: ['$biwReview.status', 'Rejected'] }, 1, 0] }
+                },
+                biwDefectCount: {
+                  $sum: { $cond: [{ $in: ['$biwReview.status', ['Rejected', 'Reworked']] }, 1, 0] }
+                },
+                biwReviewedCount: {
+                  $sum: { $cond: [{ $in: ['$biwReview.status', ['Accepted', 'Rejected', 'Reworked']] }, 1, 0] }
+                },
+                tvsAcceptCount: {
                   $sum: {
                     $cond: [
-                      { $eq: ['$biwReview.status', 'Accepted'] },
+                      { $or: [{ $eq: ['$review.status', 'Accepted'] }, { $eq: ['$review.reviewOption', 'Accepted'] }] },
                       1,
                       0
                     ]
                   }
                 },
-                biwDefectCount: {
+                tvsRejectCount: {
                   $sum: {
                     $cond: [
-                      { $in: ['$biwReview.status', ['Rejected', 'Reworked']] },
+                      { $or: [{ $eq: ['$review.status', 'Rejected'] }, { $eq: ['$review.reviewOption', 'Rejected'] }] },
+                      1,
+                      0
+                    ]
+                  }
+                },
+                tvsReworkCount: {
+                  $sum: {
+                    $cond: [
+                      { $or: [{ $in: ['$review.status', ['Rework', 'Reworked']] }, { $in: ['$review.reviewOption', ['Rework', 'Reworked']] }] },
+                      1,
+                      0
+                    ]
+                  }
+                },
+                tvsReviewedCount: {
+                  $sum: {
+                    $cond: [
+                      { $or: [{ $in: ['$review.status', ['Accepted', 'Rejected', 'Rework', 'Reworked']] }, { $in: ['$review.reviewOption', ['Accepted', 'Rejected', 'Rework', 'Reworked']] }] },
+                      1,
+                      0
+                    ]
+                  }
+                },
+                dispatchedCount: {
+                  $sum: {
+                    $cond: [
+                      {
+                        $or: [
+                          { $eq: ['$isDispatched', true] },
+                          { $and: [{ $ne: ['$dispatchedAt', null] }, { $gt: ['$dispatchedAt', ''] }] }
+                        ]
+                      },
                       1,
                       0
                     ]
@@ -3582,7 +4609,10 @@ export const getQualitySummary = async (req, res) => {
           byInspector: [
             {
               $group: {
-                _id: { $ifNull: ['$submittedBy', 'Unknown Submitter'] },
+                _id: {
+                  inspector: { $trim: { input: { $ifNull: ['$submittedBy', 'Unknown Submitter'] } } },
+                  formKey: '$questionId'
+                },
                 totalChecked: { $sum: 1 },
                 defectCount: {
                   $sum: {
@@ -3590,7 +4620,36 @@ export const getQualitySummary = async (req, res) => {
                       {
                         $or: [
                           { $in: ['$biwReview.status', ['Rejected', 'Reworked']] },
-                          { $regexMatch: { input: { $toLower: { $ifNull: ['$status', ''] } }, regex: 'rework|rejected|defect|fail' } }
+                          { $in: ['$review.status', ['Rejected', 'Rework', 'Reworked']] },
+                          { $in: ['$review.reviewOption', ['Rejected', 'Rework', 'Reworked']] },
+                          { $regexMatch: { input: { $toLower: { $ifNull: ['$status', ''] } }, regex: 'rework|rejected|defect|fail' } },
+                          {
+                            $anyElementTrue: {
+                              $map: {
+                                input: { $objectToArray: { $ifNull: ['$answers', {}] } },
+                                as: 'ans',
+                                in: {
+                                  $regexMatch: {
+                                    input: {
+                                      $toLower: {
+                                        $ifNull: [
+                                          '$$ans.v.status',
+                                          {
+                                            $cond: [
+                                              { $eq: [{ $type: '$$ans.v' }, 'string'] },
+                                              '$$ans.v',
+                                              ''
+                                            ]
+                                          }
+                                        ]
+                                      }
+                                    },
+                                    regex: 'rework|rejected|defect|fail|not ok'
+                                  }
+                                }
+                              }
+                            }
+                          }
                         ]
                       },
                       1,
@@ -3601,30 +4660,108 @@ export const getQualitySummary = async (req, res) => {
                 rework1Count: {
                   $sum: {
                     $cond: [
-                      { $regexMatch: { input: { $toLower: { $ifNull: ['$status', ''] } }, regex: 'rework 1' } },
+                      {
+                        $or: [
+                          { $eq: ['$biwReview.status', 'Reworked'] },
+                          { $in: ['$review.status', ['Rework', 'Reworked']] },
+                          { $in: ['$review.reviewOption', ['Rework', 'Reworked']] },
+                          { $regexMatch: { input: { $toLower: { $ifNull: ['$status', ''] } }, regex: 'rework' } }
+                        ]
+                      },
+                      1,
+                      0
+                    ]
+                  }
+                },
+                reworkAcceptedCount: {
+                  $sum: {
+                    $cond: [
+                      { $regexMatch: { input: { $toLower: { $ifNull: ['$status', ''] } }, regex: 'rework accept|rework complete' } },
+                      1,
+                      0
+                    ]
+                  }
+                },
+                rejectedCount: {
+                  $sum: {
+                    $cond: [
+                      {
+                        $or: [
+                          { $eq: ['$biwReview.status', 'Rejected'] },
+                          { $eq: ['$review.status', 'Rejected'] },
+                          { $eq: ['$review.reviewOption', 'Rejected'] },
+                          { $regexMatch: { input: { $toLower: { $ifNull: ['$status', ''] } }, regex: 'reject' } }
+                        ]
+                      },
                       1,
                       0
                     ]
                   }
                 },
                 biwAcceptCount: {
+                  $sum: { $cond: [{ $eq: ['$biwReview.status', 'Accepted'] }, 1, 0] }
+                },
+                biwRejectCount: {
+                  $sum: { $cond: [{ $eq: ['$biwReview.status', 'Rejected'] }, 1, 0] }
+                },
+                biwDefectCount: {
+                  $sum: { $cond: [{ $in: ['$biwReview.status', ['Rejected', 'Reworked']] }, 1, 0] }
+                },
+                biwReviewedCount: {
+                  $sum: { $cond: [{ $in: ['$biwReview.status', ['Accepted', 'Rejected', 'Reworked']] }, 1, 0] }
+                },
+                tvsAcceptCount: {
                   $sum: {
                     $cond: [
-                      { $eq: ['$biwReview.status', 'Accepted'] },
+                      { $or: [{ $eq: ['$review.status', 'Accepted'] }, { $eq: ['$review.reviewOption', 'Accepted'] }] },
                       1,
                       0
                     ]
                   }
                 },
-                biwDefectCount: {
+                tvsRejectCount: {
                   $sum: {
                     $cond: [
-                      { $in: ['$biwReview.status', ['Rejected', 'Reworked']] },
+                      { $or: [{ $eq: ['$review.status', 'Rejected'] }, { $eq: ['$review.reviewOption', 'Rejected'] }] },
                       1,
                       0
                     ]
                   }
-                }
+                },
+                tvsReworkCount: {
+                  $sum: {
+                    $cond: [
+                      { $or: [{ $in: ['$review.status', ['Rework', 'Reworked']] }, { $in: ['$review.reviewOption', ['Rework', 'Reworked']] }] },
+                      1,
+                      0
+                    ]
+                  }
+                },
+                tvsReviewedCount: {
+                  $sum: {
+                    $cond: [
+                      { $or: [{ $in: ['$review.status', ['Accepted', 'Rejected', 'Rework', 'Reworked']] }, { $in: ['$review.reviewOption', ['Accepted', 'Rejected', 'Rework', 'Reworked']] }] },
+                      1,
+                      0
+                    ]
+                  }
+                },
+                dispatchedCount: {
+                  $sum: {
+                    $cond: [
+                      {
+                        $or: [
+                          { $eq: ['$isDispatched', true] },
+                          { $and: [{ $ne: ['$dispatchedAt', null] }, { $gt: ['$dispatchedAt', ''] }] }
+                        ]
+                      },
+                      1,
+                      0
+                    ]
+                  }
+                },
+                tenantId: { $first: '$tenantId' },
+                createdBy: { $first: '$createdBy' }
               }
             }
           ],
@@ -3632,7 +4769,14 @@ export const getQualitySummary = async (req, res) => {
             {
               $group: {
                 _id: {
-                  $dateToString: { format: '%Y-%m-%d', date: '$createdAt' }
+                  date: {
+                    $cond: [
+                      { $eq: [{ $type: '$createdAt' }, 'date'] },
+                      { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
+                      { $substrCP: [{ $ifNull: ['$createdAt', '1970-01-01'] }, 0, 10] }
+                    ]
+                  },
+                  formKey: '$questionId'
                 },
                 totalChecked: { $sum: 1 },
                 defectCount: {
@@ -3641,7 +4785,36 @@ export const getQualitySummary = async (req, res) => {
                       {
                         $or: [
                           { $in: ['$biwReview.status', ['Rejected', 'Reworked']] },
-                          { $regexMatch: { input: { $toLower: { $ifNull: ['$status', ''] } }, regex: 'rework|rejected|defect|fail' } }
+                          { $in: ['$review.status', ['Rejected', 'Rework', 'Reworked']] },
+                          { $in: ['$review.reviewOption', ['Rejected', 'Rework', 'Reworked']] },
+                          { $regexMatch: { input: { $toLower: { $ifNull: ['$status', ''] } }, regex: 'rework|rejected|defect|fail' } },
+                          {
+                            $anyElementTrue: {
+                              $map: {
+                                input: { $objectToArray: { $ifNull: ['$answers', {}] } },
+                                as: 'ans',
+                                in: {
+                                  $regexMatch: {
+                                    input: {
+                                      $toLower: {
+                                        $ifNull: [
+                                          '$$ans.v.status',
+                                          {
+                                            $cond: [
+                                              { $eq: [{ $type: '$$ans.v' }, 'string'] },
+                                              '$$ans.v',
+                                              ''
+                                            ]
+                                          }
+                                        ]
+                                      }
+                                    },
+                                    regex: 'rework|rejected|defect|fail|not ok'
+                                  }
+                                }
+                              }
+                            }
+                          }
                         ]
                       },
                       1,
@@ -3652,7 +4825,14 @@ export const getQualitySummary = async (req, res) => {
                 reworkCount: {
                   $sum: {
                     $cond: [
-                      { $regexMatch: { input: { $toLower: { $ifNull: ['$status', ''] } }, regex: 'rework 1' } },
+                      {
+                        $or: [
+                          { $eq: ['$biwReview.status', 'Reworked'] },
+                          { $in: ['$review.status', ['Rework', 'Reworked']] },
+                          { $in: ['$review.reviewOption', ['Rework', 'Reworked']] },
+                          { $regexMatch: { input: { $toLower: { $ifNull: ['$status', ''] } }, regex: 'rework' } }
+                        ]
+                      },
                       1,
                       0
                     ]
@@ -3674,7 +4854,8 @@ export const getQualitySummary = async (req, res) => {
                 questionId: 1,
                 formId: 1,
                 isDispatched: 1,
-                chassisNumber: 1
+                chassisNumber: 1,
+                answers: 1
               }
             }
           ],
@@ -3683,99 +4864,479 @@ export const getQualitySummary = async (req, res) => {
               $match: {
                 $or: [
                   { 'biwReview.status': { $in: ['Rejected', 'Reworked'] } },
+                  { 'review.status': { $in: ['Rejected', 'Rework', 'Reworked'] } },
+                  { 'review.reviewOption': { $in: ['Rejected', 'Rework', 'Reworked'] } },
                   { status: { $regex: 'rework|rejected|defect|fail', $options: 'i' } }
                 ]
               }
             },
-            { $limit: 100 },
-            { $project: { _id: 1, submittedBy: 1, answers: 1 } }
+            { $limit: 300 },
+            { $project: { _id: 1, submittedBy: 1, questionId: 1, answers: 1, biwReview: 1, review: 1, status: 1 } }
           ]
         }
       }
     ];
 
-    const aggResult = await Response.aggregate(pipeline).option({ maxTimeMS: 60000 });
+    const aggResult = await Response.aggregate(pipeline).option({ maxTimeMS: 90000, allowDiskUse: true });
     const agg = aggResult[0] || {};
 
     const summary = agg.summary?.[0] || { totalChecked: 0, defectCount: 0, rework1Count: 0 };
     const totalChecked = summary.totalChecked || 0;
-    const totalDefects = summary.defectCount || 0;
-    const totalAccepted = Math.max(0, totalChecked - totalDefects);
+    let totalDefects = summary.defectCount || 0;
+    let totalAccepted = Math.max(0, totalChecked - totalDefects);
     const totalRework1 = summary.rework1Count || 0;
-    const overallAcceptRate = totalChecked > 0 ? Math.round((totalAccepted / totalChecked) * 10000) / 100 : 0;
-    const overallDefectRate = Math.max(0, Math.round((100 - overallAcceptRate) * 100) / 100);
+    let overallAcceptRate = totalChecked > 0 ? Math.round((totalAccepted / totalChecked) * 10000) / 100 : 0;
+    let overallDefectRate = Math.max(0, Math.round((100 - overallAcceptRate) * 100) / 100);
 
-    // Defect breakdown extraction from top defect responses
-    const defectTypeMap = {};
-    const inspectorDefectMap = {};
+    const reworkAcceptedCount = summary.reworkAcceptedCount || 0;
+    const rejectedCount = summary.rejectedCount !== undefined ? summary.rejectedCount : Math.max(0, totalDefects - totalRework1);
+    const directOkCount = Math.max(0, totalAccepted - reworkAcceptedCount);
 
-    (agg.defectResponses || []).forEach(dr => {
-      const rawName = (dr.submittedBy || 'Unknown Submitter').trim();
-      if (!inspectorDefectMap[rawName]) inspectorDefectMap[rawName] = {};
+    const totalDispatched = summary.dispatchedCount || 0;
+    // Pending Dispatch: strictly for the last 30 days alone
+    const isWiderThan30Days = !startDate || (startObj && startObj < thirtyDaysAgo);
+    const approved30 = Math.max(0, (summary.total30Count || 0) - (summary.defect30Count || 0));
+    const pendingDispatch = isWiderThan30Days && summary.total30Count !== undefined
+      ? Math.max(0, approved30 - (summary.dispatched30Count || 0))
+      : Math.max(0, (directOkCount + reworkAcceptedCount) - totalDispatched);
+    const totalBiwReviewed = summary.biwReviewedCount || 0;
+    const pendingBiw = Math.max(0, totalDispatched - totalBiwReviewed);
 
-      if (dr.answers && typeof dr.answers === 'object') {
-        const answersObj = dr.answers instanceof Map ? Object.fromEntries(dr.answers) : dr.answers;
-        for (const [key, val] of Object.entries(answersObj)) {
-          if (!val) continue;
-          let isDef = false;
-          if (typeof val === 'object' && val.status) {
-            const st = String(val.status).trim().toLowerCase();
-            if (['rework', 'reworked', 'defect', 'rejected', 'no', 'not ok'].includes(st)) isDef = true;
-          } else if (typeof val === 'string') {
-            const vLow = val.trim().toLowerCase();
-            if (['rework', 'reworked', 'defect', 'rejected', 'no', 'not ok'].includes(vLow)) isDef = true;
-          }
+    summary.totalChecked = totalChecked;
+    summary.totalAccepted = totalAccepted;
+    summary.totalDefects = totalDefects;
+    summary.totalRework1 = totalRework1;
+    summary.totalDispatched = totalDispatched;
+    summary.pendingDispatch = pendingDispatch;
+    summary.totalBiwReviewed = totalBiwReviewed;
+    summary.pendingBiw = pendingBiw;
+    summary.reworkAcceptedCount = reworkAcceptedCount;
+    summary.rejectedCount = rejectedCount;
+    summary.directOkCount = directOkCount;
+    summary.overallAcceptRate = overallAcceptRate;
+    summary.overallDefectRate = overallDefectRate;
+    summary.dispatchedRate = totalChecked > 0 ? Math.round((totalDispatched / totalChecked) * 10000) / 100 : 0;
+    summary.biwReviewedRate = totalChecked > 0 ? Math.round((totalBiwReviewed / totalChecked) * 10000) / 100 : 0;
 
-          if (isDef) {
-            const qTitle = questionTitleMap[key] || key;
-            defectTypeMap[qTitle] = (defectTypeMap[qTitle] || 0) + 1;
-            inspectorDefectMap[rawName][qTitle] = (inspectorDefectMap[rawName][qTitle] || 0) + 1;
+    // TVS Review counts
+    let tvsReviewedCount = summary.tvsReviewedCount || 0;
+    let tvsAcceptCount = summary.tvsAcceptCount || 0;
+    let tvsRejectCount = summary.tvsRejectCount || 0;
+    let tvsReworkCount = summary.tvsReworkCount || 0;
+
+    // Fast-path: Only check separate Review collection if not already captured from responses
+    if (tvsReviewedCount === 0) {
+      try {
+        const reviewFilter = {
+          ...(req.user?.tenantId ? {
+            $or: [
+              { tenantId: req.user.tenantId.toString() },
+              { tenantId: new mongoose.Types.ObjectId(req.user.tenantId) }
+            ]
+          } : {}),
+          ...(startObj || endObj ? { createdAt: { ...(startObj ? { $gte: startObj } : {}), ...(endObj ? { $lte: endObj } : {}) } } : {})
+        };
+        const collReviews = await Review.aggregate([
+          { $match: reviewFilter },
+          { $group: { _id: '$reviewOption', count: { $sum: 1 } } }
+        ]).option({ maxTimeMS: 5000 });
+        if (collReviews && collReviews.length > 0) {
+          let collAccept = 0, collReject = 0, collRework = 0;
+          collReviews.forEach(r => {
+            if (r._id === 'Accepted') collAccept += r.count;
+            else if (r._id === 'Rejected') collReject += r.count;
+            else if (r._id === 'Rework' || r._id === 'Reworked') collRework += r.count;
+          });
+          const collTotal = collAccept + collReject + collRework;
+          if (collTotal > tvsReviewedCount) {
+            tvsReviewedCount = collTotal;
+            tvsAcceptCount = collAccept;
+            tvsRejectCount = collReject;
+            tvsReworkCount = collRework;
           }
         }
+      } catch (e) {
+        console.warn('[Quality Summary] Could not query Review collection:', e.message);
       }
-    });
+    }
+
+    summary.tvsReviewedCount = tvsReviewedCount;
+    summary.tvsAcceptCount = tvsAcceptCount;
+    summary.tvsRejectCount = tvsRejectCount;
+    summary.tvsReworkCount = tvsReworkCount;
+    summary.pendingTvsReview = Math.max(0, totalDispatched - tvsReviewedCount);
+
+    // Defect breakdown extraction from responses (direct from aggregation facet)
+    const defectTypeMap = {};
+    const biwDefectTypeMap = {};
+    const tvsDefectTypeMap = {};
+    const inspectorDefectMap = {};
+    const defectFormMap = {};
+    const biwDefectFormMap = {};
+    const tvsDefectFormMap = {};
+    const inspectorDefectUnitCount = {};
+    let totalDefectUnits = 0;
+
+    try {
+      const defectScanResponses = (agg.defectResponses && agg.defectResponses.length > 0)
+        ? agg.defectResponses
+        : [];
+
+      defectScanResponses.forEach(dr => {
+        const fTitle = formTitleMap[dr.questionId] || 'Selected Form';
+        const rawName = (dr.submittedBy || 'Unknown Submitter').trim();
+        if (!inspectorDefectMap[rawName]) inspectorDefectMap[rawName] = {};
+
+        let hasDefect = false;
+
+        // 1. Defect extraction from answers (Factory floor / General inspection)
+        if (dr.answers && typeof dr.answers === 'object') {
+          const answersObj = dr.answers instanceof Map ? Object.fromEntries(dr.answers) : dr.answers;
+          for (const [key, val] of Object.entries(answersObj)) {
+            if (!val || key === 'chassis_number' || key === 'chassis') continue;
+            let isDef = false;
+            if (typeof val === 'object' && val.status) {
+              const st = String(val.status).trim().toLowerCase();
+              if (['rework', 'reworked', 'defect', 'rejected', 'no', 'not ok', 'fail'].includes(st)) isDef = true;
+            } else if (typeof val === 'string') {
+              const vLow = val.trim().toLowerCase();
+              if (['rework', 'reworked', 'defect', 'rejected', 'no', 'not ok', 'fail'].includes(vLow)) isDef = true;
+            }
+
+            if (isDef) {
+              hasDefect = true;
+              const qTitle = questionTitleMap[key] || key;
+              defectTypeMap[qTitle] = (defectTypeMap[qTitle] || 0) + 1;
+              inspectorDefectMap[rawName][qTitle] = (inspectorDefectMap[rawName][qTitle] || 0) + 1;
+              if (!defectFormMap[qTitle]) defectFormMap[qTitle] = {};
+              defectFormMap[qTitle][fTitle] = (defectFormMap[qTitle][fTitle] || 0) + 1;
+            }
+          }
+        }
+
+        // 2. Defect extraction from biwReview (Specifically for BIW Review tab)
+        if (dr.biwReview) {
+          const bStatus = String(dr.biwReview.status || '').toLowerCase();
+          const isBiwDefect = bStatus.includes('reject') || bStatus.includes('rework');
+          if (isBiwDefect) hasDefect = true;
+
+          let biwFlaggedFound = false;
+          if (Array.isArray(dr.biwReview.flaggedQuestions)) {
+            dr.biwReview.flaggedQuestions.forEach(fq => {
+              const fqTitle = (fq.questionText || fq.text || fq.title || questionTitleMap[fq.questionId] || fq.reason || '').trim();
+              if (fqTitle && !['other', 'none', '-', 'ok', 'accepted'].includes(fqTitle.toLowerCase())) {
+                biwDefectTypeMap[fqTitle] = (biwDefectTypeMap[fqTitle] || 0) + 1;
+                if (!biwDefectFormMap[fqTitle]) biwDefectFormMap[fqTitle] = {};
+                biwDefectFormMap[fqTitle][fTitle] = (biwDefectFormMap[fqTitle][fTitle] || 0) + 1;
+                biwFlaggedFound = true;
+              }
+            });
+          }
+          if (dr.biwReview.reason && typeof dr.biwReview.reason === 'string') {
+            const reasonTitle = dr.biwReview.reason.trim();
+            if (reasonTitle && !['other', 'none', '-', 'ok', 'accepted'].includes(reasonTitle.toLowerCase())) {
+              biwDefectTypeMap[reasonTitle] = (biwDefectTypeMap[reasonTitle] || 0) + 1;
+              if (!biwDefectFormMap[reasonTitle]) biwDefectFormMap[reasonTitle] = {};
+              biwDefectFormMap[reasonTitle][fTitle] = (biwDefectFormMap[reasonTitle][fTitle] || 0) + 1;
+              biwFlaggedFound = true;
+            }
+          }
+          // If BIW rejected/reworked without specific flagged question text, extract this response's defect answers
+          if (isBiwDefect && !biwFlaggedFound && dr.answers && typeof dr.answers === 'object') {
+            const answersObj = dr.answers instanceof Map ? Object.fromEntries(dr.answers) : dr.answers;
+            for (const [key, val] of Object.entries(answersObj)) {
+              if (!val || key === 'chassis_number' || key === 'chassis') continue;
+              let isDef = false;
+              if (typeof val === 'object' && val.status) {
+                const st = String(val.status).trim().toLowerCase();
+                if (['rework', 'reworked', 'defect', 'rejected', 'no', 'not ok', 'fail'].includes(st)) isDef = true;
+              } else if (typeof val === 'string') {
+                const vLow = val.trim().toLowerCase();
+                if (['rework', 'reworked', 'defect', 'rejected', 'no', 'not ok', 'fail'].includes(vLow)) isDef = true;
+              }
+              if (isDef) {
+                const qTitle = questionTitleMap[key] || key;
+                biwDefectTypeMap[qTitle] = (biwDefectTypeMap[qTitle] || 0) + 1;
+                if (!biwDefectFormMap[qTitle]) biwDefectFormMap[qTitle] = {};
+                biwDefectFormMap[qTitle][fTitle] = (biwDefectFormMap[qTitle][fTitle] || 0) + 1;
+              }
+            }
+          }
+        }
+
+        // 3. Defect extraction from TVS review (Specifically for TVS Review tab)
+        if (dr.review) {
+          const revStatus = String(dr.review.status || dr.review.reviewOption || '').toLowerCase();
+          const isTvsDefect = revStatus.includes('reject') || revStatus.includes('rework');
+          if (isTvsDefect) hasDefect = true;
+
+          let tvsFlaggedFound = false;
+          if (Array.isArray(dr.review.flaggedQuestions)) {
+            dr.review.flaggedQuestions.forEach(fq => {
+              const fqTitle = (fq.questionText || fq.text || fq.title || questionTitleMap[fq.questionId] || fq.reason || '').trim();
+              if (fqTitle && !['other', 'none', '-', 'ok', 'accepted'].includes(fqTitle.toLowerCase())) {
+                tvsDefectTypeMap[fqTitle] = (tvsDefectTypeMap[fqTitle] || 0) + 1;
+                if (!tvsDefectFormMap[fqTitle]) tvsDefectFormMap[fqTitle] = {};
+                tvsDefectFormMap[fqTitle][fTitle] = (tvsDefectFormMap[fqTitle][fTitle] || 0) + 1;
+                tvsFlaggedFound = true;
+              }
+            });
+          }
+          const revReason = (dr.review.reason || dr.review.remark || '').trim();
+          if (revReason && !['other', 'none', '-', 'ok', 'accepted', 'test', 'rework requested for flagged questions.'].includes(revReason.toLowerCase())) {
+            tvsDefectTypeMap[revReason] = (tvsDefectTypeMap[revReason] || 0) + 1;
+            if (!tvsDefectFormMap[revReason]) tvsDefectFormMap[revReason] = {};
+            tvsDefectFormMap[revReason][fTitle] = (tvsDefectFormMap[revReason][fTitle] || 0) + 1;
+            tvsFlaggedFound = true;
+          }
+          if (isTvsDefect && !tvsFlaggedFound && dr.answers && typeof dr.answers === 'object') {
+            const answersObj = dr.answers instanceof Map ? Object.fromEntries(dr.answers) : dr.answers;
+            for (const [key, val] of Object.entries(answersObj)) {
+              if (!val || key === 'chassis_number' || key === 'chassis') continue;
+              let isDef = false;
+              if (typeof val === 'object' && val.status) {
+                const st = String(val.status).trim().toLowerCase();
+                if (['rework', 'reworked', 'defect', 'rejected', 'no', 'not ok', 'fail'].includes(st)) isDef = true;
+              } else if (typeof val === 'string') {
+                const vLow = val.trim().toLowerCase();
+                if (['rework', 'reworked', 'defect', 'rejected', 'no', 'not ok', 'fail'].includes(vLow)) isDef = true;
+              }
+              if (isDef) {
+                const qTitle = questionTitleMap[key] || key;
+                tvsDefectTypeMap[qTitle] = (tvsDefectTypeMap[qTitle] || 0) + 1;
+                if (!tvsDefectFormMap[qTitle]) tvsDefectFormMap[qTitle] = {};
+                tvsDefectFormMap[qTitle][fTitle] = (tvsDefectFormMap[qTitle][fTitle] || 0) + 1;
+              }
+            }
+          }
+        }
+
+        if (hasDefect) {
+          totalDefectUnits++;
+          inspectorDefectUnitCount[rawName] = (inspectorDefectUnitCount[rawName] || 0) + 1;
+        }
+      });
+
+      // Extract TVS defects from Review collection for reviews stored externally
+      try {
+        const reviewFilter = {
+          $or: [
+            { reviewOption: { $in: ['Rejected', 'Rework'] } },
+            { status: { $in: ['Rejected', 'Rework'] } },
+            { 'flaggedQuestions.0': { $exists: true } }
+          ],
+          ...(startObj || endObj ? { createdAt: { ...(startObj ? { $gte: startObj } : {}), ...(endObj ? { $lte: endObj } : {}) } } : { createdAt: { $gte: thirtyDaysAgo } })
+        };
+        const collReviews = await Review.find(reviewFilter).select('flaggedQuestions reason remark reviewOption status').lean().limit(100);
+        collReviews.forEach(rev => {
+          if (Array.isArray(rev.flaggedQuestions)) {
+            rev.flaggedQuestions.forEach(fq => {
+              const fqTitle = (fq.questionText || fq.text || fq.title || questionTitleMap[fq.questionId] || fq.reason || '').trim();
+              if (fqTitle && !['other', 'none', '-', 'ok', 'accepted'].includes(fqTitle.toLowerCase())) {
+                tvsDefectTypeMap[fqTitle] = (tvsDefectTypeMap[fqTitle] || 0) + 1;
+              }
+            });
+          }
+          const revReason = (rev.reason || rev.remark || '').trim();
+          if (revReason && !['other', 'none', '-', 'ok', 'accepted', 'test', 'rework requested for flagged questions.'].includes(revReason.toLowerCase())) {
+            tvsDefectTypeMap[revReason] = (tvsDefectTypeMap[revReason] || 0) + 1;
+          }
+        });
+      } catch (collErr) {
+        console.warn('[Quality Summary] Coll reviews defect extraction note:', collErr.message);
+      }
+    } catch (err) {
+      console.warn('[Quality Summary] Defect extraction error:', err.message);
+    }
+
+    const computedDefectTotal = Object.values(defectTypeMap).reduce((a, b) => a + b, 0);
+    if (totalDefectUnits > totalDefects || totalDefects === 0) {
+      totalDefects = totalDefectUnits > 0 ? totalDefectUnits : computedDefectTotal;
+      totalAccepted = Math.max(0, totalChecked - totalDefects);
+      overallAcceptRate = totalChecked > 0 ? Math.round((totalAccepted / totalChecked) * 10000) / 100 : 0;
+      overallDefectRate = Math.max(0, Math.round((100 - overallAcceptRate) * 100) / 100);
+      summary.defectCount = totalDefects;
+      summary.totalAccepted = totalAccepted;
+      summary.overallAcceptRate = overallAcceptRate;
+      summary.overallDefectRate = overallDefectRate;
+    }
 
     const defectBreakdown = Object.entries(defectTypeMap)
       .sort((a, b) => b[1] - a[1])
-      .map(([name, count]) => ({ name, count }));
+      .map(([name, count]) => ({
+        name,
+        count,
+        forms: defectFormMap[name] || {}
+      }));
 
-    // Per-Form Summary List
+    const biwDefectBreakdown = Object.entries(biwDefectTypeMap)
+      .sort((a, b) => b[1] - a[1])
+      .map(([name, count]) => ({
+        name,
+        count,
+        forms: biwDefectFormMap[name] || {}
+      }));
+
+    const tvsDefectBreakdown = Object.entries(tvsDefectTypeMap)
+      .sort((a, b) => b[1] - a[1])
+      .map(([name, count]) => ({
+        name,
+        count,
+        forms: tvsDefectFormMap[name] || {}
+      }));
+
+    // Per-Form Summary List - Combine metrics for both UUID and ObjectId keys of each form
     const formMetricMap = {};
     (agg.byForm || []).forEach(item => {
       formMetricMap[item._id] = item;
     });
 
     const formsSummary = accessibleForms.map(f => {
-      const m = formMetricMap[f.id] || formMetricMap[f._id.toString()] || {};
-      const tChecked = m.totalChecked || 0;
-      const dCount = m.defectCount || 0;
+      const keys = [f.id, f._id ? f._id.toString() : ''].filter(Boolean);
+      let tChecked = 0;
+      let dCount = 0;
+      let r1Count = 0;
+      let rwAccepted = 0;
+      let rejCount = 0;
+      let bAccept = 0;
+      let bReject = 0;
+      let bDefect = 0;
+      let bReviewed = 0;
+      let dDispatched = 0;
+      let t30 = 0;
+      let disp30 = 0;
+      let def30 = 0;
+      let tvsAccept = 0;
+      let tvsReject = 0;
+      let tvsRework = 0;
+      let tvsReviewed = 0;
+      const inspectorSet = new Set();
+      let lastDate = null;
+
+      keys.forEach(k => {
+        const m = formMetricMap[k];
+        if (m) {
+          tChecked += m.totalChecked || 0;
+          dCount += m.defectCount || 0;
+          r1Count += m.rework1Count || 0;
+          rwAccepted += m.reworkAcceptedCount || 0;
+          rejCount += m.rejectedCount || 0;
+          bAccept += m.biwAcceptCount || 0;
+          bReject += m.biwRejectCount || 0;
+          bDefect += m.biwDefectCount || 0;
+          bReviewed += m.biwReviewedCount || 0;
+          dDispatched += m.dispatchedCount || 0;
+          t30 += m.total30Count || 0;
+          disp30 += m.dispatched30Count || 0;
+          def30 += m.defect30Count || 0;
+          tvsAccept += m.tvsAcceptCount || 0;
+          tvsReject += m.tvsRejectCount || 0;
+          tvsRework += m.tvsReworkCount || 0;
+          tvsReviewed += m.tvsReviewedCount || 0;
+          if (Array.isArray(m.inspectors)) {
+            m.inspectors.forEach(insp => { if (insp) inspectorSet.add(insp); });
+          }
+          if (m.lastInspectionDate) {
+            if (!lastDate || new Date(m.lastInspectionDate) > new Date(lastDate)) {
+              lastDate = m.lastInspectionDate;
+            }
+          }
+        }
+      });
+
+      if (dCount === 0) {
+        const formDefectSum = Object.values(defectFormMap).reduce((sum, fMap) => sum + (fMap[f.title] || 0), 0);
+        if (formDefectSum > 0) {
+          dCount = formDefectSum;
+          r1Count = formDefectSum;
+        }
+      }
+
       const aCount = Math.max(0, tChecked - dCount);
       const aRate = tChecked > 0 ? Math.round((aCount / tChecked) * 10000) / 100 : 0;
       const dRate = Math.max(0, Math.round((100 - aRate) * 100) / 100);
+
+      // Reconcile defects, rework and rejected counts strictly
+      let finalRej = rejCount;
+      let finalR1 = r1Count;
+      if (dCount > 0) {
+        if (finalRej + finalR1 !== dCount) {
+          if (finalRej > 0 && finalR1 === 0) {
+            finalR1 = Math.max(0, dCount - finalRej);
+          } else if (finalR1 > 0 && finalRej === 0) {
+            finalRej = Math.max(0, dCount - finalR1);
+          } else if (finalRej === 0 && finalR1 === 0) {
+            finalR1 = dCount;
+          }
+        }
+      }
+
+      const biwTotal = bReviewed > 0 ? bReviewed : (bAccept + bDefect);
+      const biwRate = biwTotal > 0 ? Math.round((bAccept / biwTotal) * 10000) / 100 : (tChecked > 0 ? 100 : 0);
+      const directOk = Math.max(0, aCount - rwAccepted);
 
       return {
         id: f.id || f._id.toString(),
         _id: f._id.toString(),
         title: f.title,
+        isChildForm: Boolean(f.isChildForm || f.parentFormId),
+        parentFormId: f.parentFormId ? f.parentFormId.toString() : null,
+        parentFormTitle: f.parentFormTitle || null,
+        childForms: f.childForms || [],
         totalChecked: tChecked,
         acceptCount: aCount,
         defectCount: dCount,
-        rework1Count: m.rework1Count || 0,
-        biwAcceptCount: m.biwAcceptCount || 0,
-        biwDefectCount: m.biwDefectCount || 0,
+        rework1Count: finalR1,
+        reworkAcceptedCount: rwAccepted,
+        rejectedCount: finalRej,
+        directOkCount: directOk,
+        dispatchedCount: dDispatched,
+        pendingDispatchCount: isWiderThan30Days && t30 > 0
+          ? Math.max(0, (t30 - def30) - disp30)
+          : Math.max(0, (directOk + rwAccepted) - dDispatched),
+        biwAcceptCount: bAccept,
+        biwRejectCount: bReject,
+        biwDefectCount: bDefect,
+        biwReviewedCount: biwTotal,
+        pendingBiwCount: Math.max(0, dDispatched - biwTotal),
+        tvsAcceptCount: tvsAccept,
+        tvsRejectCount: tvsReject,
+        tvsReworkCount: tvsRework,
+        tvsReviewedCount: tvsReviewed,
+        pendingTvsCount: Math.max(0, dDispatched - tvsReviewed),
+        biwAcceptRate: biwRate,
         acceptRate: aRate,
         defectRate: dRate,
-        totalInspectors: m.inspectors ? m.inspectors.length : 0,
-        lastInspectionDate: m.lastInspectionDate ? new Date(m.lastInspectionDate).toISOString().split('T')[0] : null
+        totalInspectors: inspectorSet.size,
+        inspectors: Array.from(inspectorSet),
+        lastInspectionDate: lastDate ? new Date(lastDate).toISOString().split('T')[0] : null,
+        masterTotal: (masterFormCounts[f.id] || 0) + (masterFormCounts[f._id?.toString()] || 0)
       };
     }).sort((a, b) => b.totalChecked - a.totalChecked);
 
-    const formOptions = formsSummary.map(f => ({
-      id: f.id,
-      _id: f._id,
-      title: f.title,
-      totalChecked: f.totalChecked
-    }));
+    const isDateFiltered = Boolean(startDate || endDate);
+    const formOptions = accessibleForms.map(f => {
+      const idStr = f.id ? f.id.toString() : '';
+      const mongoIdStr = f._id ? f._id.toString() : '';
+      const mCount = (masterFormCounts[idStr] || 0) + (masterFormCounts[mongoIdStr] || 0);
+      const keys = [idStr, mongoIdStr].filter(Boolean);
+      let activeCount = 0;
+      keys.forEach(k => {
+        const m = formMetricMap[k];
+        if (m) activeCount += m.totalChecked || 0;
+      });
+      return {
+        id: idStr || mongoIdStr,
+        _id: mongoIdStr,
+        title: f.title,
+        isChildForm: Boolean(f.isChildForm || f.parentFormId),
+        parentFormId: f.parentFormId ? f.parentFormId.toString() : null,
+        parentFormTitle: f.parentFormTitle || null,
+        totalChecked: isDateFiltered ? activeCount : mCount,
+        activeChecked: activeCount,
+        masterTotal: mCount
+      };
+    }).sort((a, b) => (b.totalChecked - a.totalChecked) || ((b.masterTotal || 0) - (a.masterTotal || 0)));
 
     // Inspector performance ratings
     let exemplaryCount = 0;
@@ -3783,7 +5344,96 @@ export const getQualitySummary = async (req, res) => {
     let metCount = 0;
     let partiallyMetCount = 0;
 
-    const inspectorList = (agg.byInspector || []).map(insp => {
+    // Build tenant lookup maps to attach tenant names to inspectors
+    const allTenantsList = await Tenant.find({}).select('_id name companyName').lean();
+    const tenantMap = {};
+    allTenantsList.forEach(t => {
+      tenantMap[t._id.toString()] = t.companyName || t.name || '';
+    });
+
+    const allUsersList = await User.find({}).select('firstName lastName username email tenantId').populate('tenantId', 'name companyName').lean();
+    const userTenantMap = {};
+    allUsersList.forEach(u => {
+      const tName = u.tenantId?.companyName || u.tenantId?.name || (u.tenantId ? tenantMap[u.tenantId.toString()] : '') || '';
+      if (tName) {
+        const full = `${u.firstName || ''} ${u.lastName || ''}`.trim().toLowerCase();
+        if (full) userTenantMap[full] = tName;
+        if (u.username) userTenantMap[u.username.trim().toLowerCase()] = tName;
+        if (u.email) userTenantMap[u.email.trim().toLowerCase()] = tName;
+        if (u.firstName) userTenantMap[u.firstName.trim().toLowerCase()] = tName;
+      }
+    });
+
+    // Aggregate inspector records by name and retain form-wise metrics
+    const inspectorAggMap = {};
+    (agg.byInspector || []).forEach(item => {
+      const inspName = typeof item._id === 'object' ? (item._id.inspector || 'Unknown Submitter') : (item._id || 'Unknown Submitter');
+      const formKey = typeof item._id === 'object' ? item._id.formKey : null;
+      const fTitle = formTitleMap[formKey] || formKey || 'Selected Form';
+      const cleanInspLower = inspName.trim().toLowerCase();
+      const resolvedTenant = userTenantMap[cleanInspLower] || (item.tenantId ? tenantMap[item.tenantId.toString()] : '') || '';
+
+      if (!inspectorAggMap[inspName]) {
+        inspectorAggMap[inspName] = {
+          name: inspName,
+          tenantName: resolvedTenant,
+          totalChecked: 0,
+          defectCount: 0,
+          rework1Count: 0,
+          reworkAcceptedCount: 0,
+          rejectedCount: 0,
+          biwAcceptCount: 0,
+          biwRejectCount: 0,
+          biwDefectCount: 0,
+          biwReviewedCount: 0,
+          tvsAcceptCount: 0,
+          tvsRejectCount: 0,
+          tvsReworkCount: 0,
+          tvsReviewedCount: 0,
+          dispatchedCount: 0,
+          forms: {}
+        };
+      } else if (!inspectorAggMap[inspName].tenantName && resolvedTenant) {
+        inspectorAggMap[inspName].tenantName = resolvedTenant;
+      }
+
+      inspectorAggMap[inspName].totalChecked += item.totalChecked || 0;
+      inspectorAggMap[inspName].defectCount += item.defectCount || 0;
+      inspectorAggMap[inspName].rework1Count += item.rework1Count || 0;
+      inspectorAggMap[inspName].reworkAcceptedCount += item.reworkAcceptedCount || 0;
+      inspectorAggMap[inspName].rejectedCount += item.rejectedCount || 0;
+      inspectorAggMap[inspName].biwAcceptCount += item.biwAcceptCount || 0;
+      inspectorAggMap[inspName].biwRejectCount += item.biwRejectCount || 0;
+      inspectorAggMap[inspName].biwDefectCount += item.biwDefectCount || 0;
+      inspectorAggMap[inspName].biwReviewedCount += item.biwReviewedCount || 0;
+      inspectorAggMap[inspName].tvsAcceptCount += item.tvsAcceptCount || 0;
+      inspectorAggMap[inspName].tvsRejectCount += item.tvsRejectCount || 0;
+      inspectorAggMap[inspName].tvsReworkCount += item.tvsReworkCount || 0;
+      inspectorAggMap[inspName].tvsReviewedCount += item.tvsReviewedCount || 0;
+      inspectorAggMap[inspName].dispatchedCount += item.dispatchedCount || 0;
+
+      if (formKey) {
+        if (!inspectorAggMap[inspName].forms[fTitle]) {
+          inspectorAggMap[inspName].forms[fTitle] = { checked: 0, defects: 0, acceptCount: 0 };
+        }
+        inspectorAggMap[inspName].forms[fTitle].checked += item.totalChecked || 0;
+        inspectorAggMap[inspName].forms[fTitle].defects += item.defectCount || 0;
+        inspectorAggMap[inspName].forms[fTitle].acceptCount += Math.max(0, (item.totalChecked || 0) - (item.defectCount || 0));
+      }
+    });
+
+    // Reconcile inspector defect counts with extracted defect units from answers / biwReview
+    Object.keys(inspectorAggMap).forEach(inspName => {
+      const insp = inspectorAggMap[inspName];
+      const extractedDefects = inspectorDefectUnitCount[inspName]
+        ?? (inspectorDefectMap[inspName] ? Object.values(inspectorDefectMap[inspName]).reduce((a, b) => a + b, 0) : 0);
+      if (extractedDefects > 0 && (insp.defectCount === 0 || extractedDefects > insp.defectCount)) {
+        insp.defectCount = Math.min(insp.totalChecked, extractedDefects);
+        insp.rework1Count = Math.max(insp.rework1Count, insp.defectCount);
+      }
+    });
+
+    const inspectorList = Object.values(inspectorAggMap).map(insp => {
       const tChecked = insp.totalChecked;
       const dCount = insp.defectCount;
       const aCount = Math.max(0, tChecked - dCount);
@@ -3813,22 +5463,37 @@ export const getQualitySummary = async (req, res) => {
         partiallyMetCount++;
       }
 
-      const biwTotal = insp.biwAcceptCount + insp.biwDefectCount;
+      const biwTotal = insp.biwReviewedCount || (insp.biwAcceptCount + insp.biwDefectCount);
       const biwAcceptRate = biwTotal > 0 ? Math.round((insp.biwAcceptCount / biwTotal) * 100) : 0;
       const biwDefectRate = Math.max(0, 100 - biwAcceptRate);
 
-      const topDefects = Object.entries(inspectorDefectMap[insp._id] || {})
+      const tvsDefectTotal = (insp.tvsRejectCount || 0) + (insp.tvsReworkCount || 0);
+      const tvsTotal = insp.tvsReviewedCount || (insp.tvsAcceptCount + tvsDefectTotal);
+      const tvsAcceptRate = tvsTotal > 0 ? Math.round((insp.tvsAcceptCount / tvsTotal) * 100) : 0;
+      const tvsDefectRate = Math.max(0, 100 - tvsAcceptRate);
+
+      const topDefects = Object.entries(inspectorDefectMap[insp.name] || {})
         .sort((a, b) => b[1] - a[1])
         .slice(0, 5)
         .map(([name, count]) => ({ name, count }));
 
       return {
-        name: insp._id,
+        name: insp.name,
+        tenantName: insp.tenantName || '',
         totalChecked: tChecked,
+        totalSubmitted: tChecked,
+        dispatched: insp.dispatchedCount || 0,
+        dispatchedCount: insp.dispatchedCount || 0,
+        totalReviewed: biwTotal,
+        accepted: insp.biwAcceptCount || 0,
+        rejected: insp.biwRejectCount || 0,
+        rework: insp.biwDefectCount || 0,
         acceptCount: aCount,
         defectCount: dCount,
         rework1Count: insp.rework1Count,
+        reworkAcceptedCount: insp.reworkAcceptedCount,
         biwAcceptCount: insp.biwAcceptCount,
+        biwRejectCount: insp.biwRejectCount,
         biwDefectCount: insp.biwDefectCount,
         acceptRate,
         defectRate,
@@ -3837,43 +5502,195 @@ export const getQualitySummary = async (req, res) => {
         arrow,
         biwAcceptRate,
         biwDefectRate,
-        topDefects
+        tvsAcceptCount: insp.tvsAcceptCount || 0,
+        tvsRejectCount: insp.tvsRejectCount || 0,
+        tvsReworkCount: insp.tvsReworkCount || 0,
+        tvsDefectCount: tvsDefectTotal,
+        tvsReviewedCount: tvsTotal,
+        tvsAcceptRate,
+        tvsDefectRate,
+        performanceScore: biwTotal > 0 ? Math.round((insp.biwAcceptCount / biwTotal) * 100) : acceptRate,
+        topDefects,
+        forms: insp.forms
       };
     }).sort((a, b) => b.totalChecked - a.totalChecked);
 
-    // Daily trends array
-    const dailyTrends = (agg.byDay || []).map(d => {
-      const aCount = Math.max(0, d.totalChecked - d.defectCount);
-      return {
-        date: d._id,
-        totalChecked: d.totalChecked,
-        acceptCount: aCount,
-        defectCount: d.defectCount,
-        reworkCount: d.reworkCount,
-        passRate: d.totalChecked > 0 ? Math.round((aCount / d.totalChecked) * 10000) / 100 : 0
-      };
+    // Daily trends array with form-wise numbers
+    const dayMap = {};
+    (agg.byDay || []).forEach(d => {
+      const dateStr = d._id?.date || d._id;
+      if (!dateStr || dateStr === '1970-01-01') return;
+      if (!dayMap[dateStr]) {
+        dayMap[dateStr] = {
+          date: dateStr,
+          totalChecked: 0,
+          defectCount: 0,
+          reworkCount: 0,
+          forms: {}
+        };
+      }
+      dayMap[dateStr].totalChecked += d.totalChecked || 0;
+      dayMap[dateStr].defectCount += d.defectCount || 0;
+      dayMap[dateStr].reworkCount += d.reworkCount || 0;
+
+      const fKey = d._id?.formKey;
+      if (fKey) {
+        const fTitle = formTitleMap[fKey] || fKey;
+        if (!dayMap[dateStr].forms[fTitle]) {
+          dayMap[dateStr].forms[fTitle] = { checked: 0, defects: 0 };
+        }
+        dayMap[dateStr].forms[fTitle].checked += d.totalChecked || 0;
+        dayMap[dateStr].forms[fTitle].defects += d.defectCount || 0;
+      }
     });
+
+    const dailyTrends = Object.values(dayMap)
+      .sort((a, b) => a.date.localeCompare(b.date))
+      .map(d => {
+        const aCount = Math.max(0, d.totalChecked - d.defectCount);
+        return {
+          date: d.date,
+          totalChecked: d.totalChecked,
+          acceptCount: aCount,
+          defectCount: d.defectCount,
+          reworkCount: d.reworkCount,
+          passRate: d.totalChecked > 0 ? Math.round((aCount / d.totalChecked) * 10000) / 100 : 0,
+          forms: d.forms
+        };
+      });
+
+    const KNOWN_STATIC_TAGS = new Set(['TVS', 'SAFTY', 'SAIFY', 'SRIDEVI', 'EXCEL IMPORT', 'N/A', '-', 'DEFAULT', 'UNKNOWN', 'NONE']);
+
+    const extractUniqueChassis = (r) => {
+      const fId = (r.formId || r.questionId)?.toString();
+      const chassisMeta = (fId && formChassisQuestionMap[fId]) || {};
+      const targetQId = chassisMeta.primaryChassisQId;
+      const ans = r.answers || {};
+
+      // 1. Check designated chassis/identification question if present
+      if (targetQId && ans[targetQId] !== undefined && ans[targetQId] !== null) {
+        const val = ans[targetQId];
+        if (typeof val === 'string' && val.trim()) return val.trim();
+        if (typeof val === 'number') return String(val);
+        if (typeof val === 'object') {
+          const v = val.chassisNumber || val.value || val.id || val.v;
+          if (v && typeof v !== 'object') return String(v).trim();
+        }
+      }
+
+      // 2. Check any other answer key that might be an identification/chassis question
+      for (const [key, val] of Object.entries(ans)) {
+        if (!val) continue;
+        const meta = questionMetaMap[key];
+        const qTitle = (meta?.text || '').toLowerCase();
+        if (
+          qTitle.includes('identification') ||
+          qTitle.includes('id number') ||
+          qTitle.includes('id no') ||
+          qTitle.includes('chassis') ||
+          qTitle.includes('vin') ||
+          qTitle.includes('serial')
+        ) {
+          if (typeof val === 'string' && val.trim() && val !== 'Accepted' && val !== 'Rejected' && val !== 'Reworked') {
+            return val.trim();
+          }
+          if (typeof val === 'number') return String(val);
+          if (typeof val === 'object') {
+            const v = val.chassisNumber || val.value || val.id;
+            if (v && typeof v !== 'object' && String(v).trim()) return String(v).trim();
+          }
+        }
+      }
+
+      // 3. Scan for any answer that looks like a unique unit code (not a status like 'Accepted'/'Rejected'/'Direct Ok')
+      for (const [key, val] of Object.entries(ans)) {
+        if (key === 'chassis_number' || key === 'chassis') continue;
+        if (typeof val === 'string') {
+          const s = val.trim();
+          const low = s.toLowerCase();
+          if (
+            s.length > 0 &&
+            s.length < 50 &&
+            !['accepted', 'rejected', 'reworked', 'pending', 'direct ok', 'rework 1', 'rework 2', 'ok', 'not ok', 'pass', 'fail', 'true', 'false', 'none', 'n/a', '-'].includes(low) &&
+            !KNOWN_STATIC_TAGS.has(s.toUpperCase()) &&
+            !s.startsWith('{') &&
+            !s.startsWith('http')
+          ) {
+            return s;
+          }
+        } else if (typeof val === 'number') {
+          return String(val);
+        }
+      }
+
+      // 4. If root r.chassisNumber exists and is NOT a known static vendor tag, use it
+      if (r.chassisNumber && !KNOWN_STATIC_TAGS.has(String(r.chassisNumber).toUpperCase().trim())) {
+        return String(r.chassisNumber).trim();
+      }
+
+      // 5. Fallback: root r.chassisNumber
+      if (r.chassisNumber && r.chassisNumber !== 'none' && r.chassisNumber !== 'N/A' && r.chassisNumber !== '-') {
+        return String(r.chassisNumber);
+      }
+
+      return 'N/A';
+    };
 
     // Recent raw responses for the Excel-like grid
     const rawResponsesList = (agg.recentResponses || []).map(r => {
       const fTitle = formTitleMap[r.questionId] || formTitleMap[r.formId] || 'Unknown Form';
       const rawSt = (r.status || '').trim();
-      let dynamicStatus = rawSt === 'Accepted' || rawSt === 'Direct Ok' || rawSt === 'Rework Accepted' ? rawSt : (rawSt.startsWith('Rework') || rawSt === 'Rejected' ? rawSt : 'Direct Ok');
+
+      const respDefects = [];
+      if (r.answers && typeof r.answers === 'object') {
+        const aObj = r.answers instanceof Map ? Object.fromEntries(r.answers) : r.answers;
+        for (const [key, val] of Object.entries(aObj)) {
+          if (!val || key === 'chassis_number' || key === 'chassis') continue;
+          let isDef = false;
+          if (typeof val === 'object' && val.status) {
+            const st = String(val.status).trim().toLowerCase();
+            if (['rework', 'reworked', 'defect', 'rejected', 'no', 'not ok'].includes(st)) isDef = true;
+          } else if (typeof val === 'string') {
+            const vLow = val.trim().toLowerCase();
+            if (['rework', 'reworked', 'defect', 'rejected', 'no', 'not ok'].includes(vLow)) isDef = true;
+          }
+          if (isDef) {
+            const qTitle = questionTitleMap[key] || key;
+            respDefects.push(qTitle);
+          }
+        }
+      }
+
+      let dynamicStatus = rawSt;
+      if (!dynamicStatus || dynamicStatus === 'pending') {
+        dynamicStatus = respDefects.length > 0 ? 'Rework 1' : 'Direct Ok';
+      } else if (dynamicStatus !== 'Accepted' && dynamicStatus !== 'Direct Ok' && dynamicStatus !== 'Rework Accepted') {
+        dynamicStatus = dynamicStatus.startsWith('Rework') || dynamicStatus === 'Rejected' ? dynamicStatus : (respDefects.length > 0 ? 'Rework 1' : 'Direct Ok');
+      }
+
+      const uniqueChassis = extractUniqueChassis(r);
+      const rootChassis = r.chassisNumber && r.chassisNumber !== 'none' && r.chassisNumber !== 'N/A' && r.chassisNumber !== '-' ? String(r.chassisNumber).trim() : '';
+      const chassisVin = (rootChassis && rootChassis.toLowerCase() !== uniqueChassis.toLowerCase()) ? rootChassis : '-';
+
+      const rawDate = r.createdAt ? new Date(r.createdAt) : new Date();
+      const safeDate = rawDate.getTime() > Date.now() ? (r.submissionMetadata?.submittedAt ? new Date(r.submissionMetadata.submittedAt) : new Date()) : rawDate;
+      const dateIso = !isNaN(safeDate.getTime()) ? safeDate.toISOString() : new Date().toISOString();
 
       return {
         id: r._id.toString(),
-        chassisNumber: r.chassisNumber && r.chassisNumber !== 'none' ? r.chassisNumber : 'N/A',
-        chassisVin: '-',
-        partDescription: '-',
+        chassisNumber: uniqueChassis,
+        chassisVin: chassisVin,
+        partDescription: chassisVin !== '-' ? chassisVin : '-',
         submittedBy: (r.submittedBy || 'Unknown Submitter').trim(),
-        date: r.createdAt ? new Date(r.createdAt).toISOString() : new Date().toISOString(),
-        createdAt: r.createdAt ? new Date(r.createdAt).toISOString() : new Date().toISOString(),
+        date: dateIso,
+        createdAt: dateIso,
         status: dynamicStatus,
         biwReviewStatus: r.biwReview?.status || (dynamicStatus === 'Direct Ok' || dynamicStatus === 'Accepted' ? 'Accepted' : 'Pending'),
         formId: (r.formId || r.questionId)?.toString() || '',
         formTitle: fTitle,
         isDispatched: Boolean(r.isDispatched),
-        defects: []
+        answers: r.answers || {},
+        defects: respDefects
       };
     });
 
@@ -3882,9 +5699,26 @@ export const getQualitySummary = async (req, res) => {
       data: {
         summary: {
           totalChecked,
+          masterTotalChecked: accessibleForms.reduce((sum, f) => {
+            const idStr = f.id ? f.id.toString() : '';
+            const mongoIdStr = f._id ? f._id.toString() : '';
+            return sum + (masterFormCounts[idStr] || 0) + (masterFormCounts[mongoIdStr] || 0);
+          }, 0),
           totalAccepted,
           totalDefects,
           totalRework1,
+          reworkAcceptedCount,
+          rejectedCount,
+          directOkCount,
+          totalDispatched,
+          pendingDispatch,
+          totalBiwReviewed,
+          pendingBiw,
+          tvsReviewedCount: summary.tvsReviewedCount || 0,
+          tvsAcceptCount: summary.tvsAcceptCount || 0,
+          tvsRejectCount: summary.tvsRejectCount || 0,
+          tvsReworkCount: summary.tvsReworkCount || 0,
+          pendingTvsReview: summary.pendingTvsReview !== undefined ? summary.pendingTvsReview : Math.max(0, totalDispatched - (summary.tvsReviewedCount || 0)),
           overallAcceptRate,
           overallDefectRate,
           totalInspectors: inspectorList.length,
@@ -3897,6 +5731,8 @@ export const getQualitySummary = async (req, res) => {
         formOptions,
         inspectors: inspectorList,
         defectBreakdown,
+        biwDefectBreakdown,
+        tvsDefectBreakdown,
         dailyTrends,
         rawResponses: rawResponsesList // Include raw forms data for the Excel-like grid
       }

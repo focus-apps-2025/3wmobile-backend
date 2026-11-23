@@ -10,6 +10,8 @@ export const initializeSocket = (server) => {
     "https://3wheelertvs.focusengineeringapp.com",
     "https://focus3rdeye.netlify.app",
     "https://threew-wheeler-backend.onrender.com",
+    "https://www.focus3rdeye.com",
+    "https://focus3rdeye.com",
     ...(process.env.CLOUDFRONT_URL ? [process.env.CLOUDFRONT_URL] : []),
     ...(process.env.FRONTEND_URL ? process.env.FRONTEND_URL.split(',').map(url => url.trim()) : [])
   ];
@@ -41,6 +43,9 @@ export const initializeSocket = (server) => {
           cleanOrigin.endsWith(".focusengineeringapp.com") ||
           cleanOrigin.endsWith(".netlify.app") ||
           cleanOrigin.endsWith(".cloudfront.net") ||
+          cleanOrigin.endsWith(".focus3rdeye.com") ||
+          cleanOrigin === "https://focus3rdeye.com" ||
+          cleanOrigin === "https://www.focus3rdeye.com" ||
           cleanOrigin === "https://focusengineeringapp.com"
         ) {
           callback(null, true);
@@ -200,5 +205,19 @@ export const emitImageProgress = (submissionId, status) => {
       timestamp: new Date()
     });
     console.log(`🖼️ Image progress: ${submissionId} - ${status.message}`);
+  }
+};
+
+export const emitFormsChanged = (data = {}) => {
+  if (io) {
+    io.emit('forms-changed', {
+      ...data,
+      timestamp: new Date()
+    });
+    io.to('dashboard-analytics').emit('forms-changed', {
+      ...data,
+      timestamp: new Date()
+    });
+    console.log('🔔 Emitted forms-changed event to all connected clients');
   }
 };

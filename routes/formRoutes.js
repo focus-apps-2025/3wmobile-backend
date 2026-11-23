@@ -108,7 +108,7 @@ router.use(addTenantFilter);
 // Form CRUD operations
 router.post('/', createForm);
 router.post('/import/csv', upload.single('file'), importFormFromCSV);
-router.get('/', getAllForms);
+router.get('/', cacheMiddleware(10), getAllForms);
 router.get('/public', cacheMiddleware(120), getPublicForms);  // Moved here for tenant isolation
 // router.get('/:id', getFormById); // Moved above
 router.put('/:id', updateForm);
@@ -116,6 +116,7 @@ router.delete('/:id', deleteForm);
 
 // Form management
 router.patch('/:id/visibility', updateFormVisibility);
+router.patch('/:id/hide', updateFormVisibility);
 router.get('/:id/location', getFormLocationEnabled);
 router.patch('/:id/location', updateFormLocationEnabled);
 router.patch('/:id/view-type', updateFormViewType);

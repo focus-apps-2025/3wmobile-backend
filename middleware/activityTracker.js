@@ -272,38 +272,58 @@ export const trackFormComplete = async (req, res, next) => {
  */
 export const recordHeartbeat = async (req, res) => {
   try {
-    const { url, sessionId } = req.body;
+    const { url, sessionId, formSessionId } = req.body;
 
-    if (req.user && req.user._id) {
-      // Handle tenantId for different user roles (superadmin may not have tenantId)
-      const tenantId = req.user.tenantId || req.user._id.toString();
+    if (req.user && req.user._id && req.user.tenantId) {
+      // Only log activity if user has a valid tenantId (superadmins without tenantId are skipped)
+      try {
+        // Debounce heartbeat logs: update the existing heartbeat record for this user within the past hour
+        // This avoids creating hundreds of thousands of individual heartbeat documents and exhausting MongoDB storage
+        const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+        await ActivityLog.findOneAndUpdate(
+          {
+            userId: req.user._id,
+            action: 'HEARTBEAT',
+            createdAt: { $gte: oneHourAgo }
+          },
+          {
+            $set: {
+              tenantId: req.user.tenantId,
+              userRole: req.user.role,
+              'metadata.url': url,
+              ipAddress: req.ip,
+              userAgent: req.get('User-Agent'),
+              sessionId: sessionId || req.sessionID,
+              lastSeen: new Date()
+            }
+          },
+          { upsert: true, setDefaultsOnInsert: true }
+        );
+      } catch (logErr) {
+        // Non-critical — don't fail the heartbeat if ActivityLog fails
+        console.warn('[Heartbeat] ActivityLog skipped:', logErr.message);
+      }
+    }
 
-      await ActivityLog.create({
-        userId: req.user._id,
-        tenantId: tenantId,
-        userRole: req.user.role,
-        action: 'HEARTBEAT',
-        metadata: { url },
-        ipAddress: req.ip,
-        userAgent: req.get('User-Agent'),
-        sessionId: sessionId || req.sessionID
-      });
-
-      // Update form session if active
-      if (req.body.formSessionId) {
+    // Update form session if active (works for all users including superadmin)
+    if (formSessionId) {
+      try {
         await FormSession.findOneAndUpdate(
-          { sessionId: req.body.formSessionId },
+          { sessionId: formSessionId },
           { lastActivityAt: new Date() }
         );
+      } catch (sessionErr) {
+        console.warn('[Heartbeat] FormSession update failed:', sessionErr.message);
       }
     }
 
     res.json({ success: true });
   } catch (error) {
     console.error('Heartbeat error:', error);
-    res.status(500).json({ success: false, message: 'Internal server error' });
+    res.json({ success: false, message: 'Heartbeat skipped' });
   }
 };
+
 
 // Helper function to detect device type
 function detectDevice(userAgent) {

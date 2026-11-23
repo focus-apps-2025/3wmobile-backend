@@ -98,6 +98,7 @@ formSessionSchema.index({ userId: 1, formId: 1, startedAt: -1 });
 formSessionSchema.index({ tenantId: 1, formId: 1, status: 1 });
 formSessionSchema.index({ tenantId: 1, startedAt: -1 });
 formSessionSchema.index({ completedAt: 1 });
+formSessionSchema.index({ createdAt: 1 }, { expireAfterSeconds: 14 * 24 * 60 * 60 }); // Auto-expire abandoned/old sessions after 14 days
 
 const FormSession = mongoose.model('FormSession', formSessionSchema);
 

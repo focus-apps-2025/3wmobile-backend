@@ -1,63 +1,20 @@
 // routes/upload.js
-import 'dotenv/config';
 import express from 'express';
 import multer from 'multer';
 import mongoose from 'mongoose';
+import fs from 'fs';
+import path from 'path';
 import { Readable } from 'stream';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { v4 as uuidv4 } from 'uuid';
 import { uploadToCloudinary } from '../services/cloudinaryService.js';
-import { uploadToS3 } from '../services/s3Service.js';
 import File from '../models/File.js';
 import { authenticate, hasPermission } from '../middleware/auth.js';
 
 const router = express.Router();
 
-// File type validation
-const ALLOWED_FILE_TYPES = {
-  'image/jpeg': 'jpg',
-  'image/png': 'png',
-  'image/gif': 'gif',
-  'image/webp': 'webp',
-  'image/svg+xml': 'svg',
-  'application/pdf': 'pdf',
-  'application/msword': 'doc',
-  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
-  'application/vnd.ms-excel': 'xls',
-  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
-  'text/csv': 'csv',
-  'text/plain': 'txt'
-};
-
-const CATEGORIES = {
-  avatars: { maxSize: 5 * 1024 * 1024, path: 'focus_forms/avatars/' },
-  forms: { maxSize: 25 * 1024 * 1024, path: 'focus_forms/forms/' },
-  templates: { maxSize: 10 * 1024 * 1024, path: 'focus_forms/templates/' },
-  exports: { maxSize: 50 * 1024 * 1024, path: 'focus_forms/exports/' },
-  evidence: { maxSize: 25 * 1024 * 1024, path: 'focus_forms/forms/' },
-  chat: { maxSize: 25 * 1024 * 1024, path: 'focus_forms/chat/' }
-};
-
-const getS3Config = () => {
-  const s3Bucket = process.env.AWS_S3_BUCKET || process.env.S3_BUCKET_NAME || 'ib-project';
-  const s3Region = process.env.AWS_S3_REGION || process.env.AWS_REGION || 'ap-south-1';
-  const cloudfrontDomain = process.env.AWS_CLOUDFRONT_DOMAIN || (process.env.CLOUDFRONT_URL ? process.env.CLOUDFRONT_URL.replace(/^https?:\/\//, '').replace(/\/+$/, '') : 'd196xvstj956a9.cloudfront.net');
-
-  if (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && s3Bucket) {
-    const s3Client = new S3Client({
-      region: s3Region,
-      credentials: {
-        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
-      }
-    });
-    return { s3Client, s3Bucket, s3Region, cloudfrontDomain };
-  }
-  return null;
-};
-
-// Direct upload handler supporting S3/CloudFront, Cloudinary and MongoDB GridFS fallback
+// Direct upload handler supporting Cloudinary, Local Disk storage, and MongoDB GridFS fallback
 const uploadMiddleware = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 25 * 1024 * 1024 }
@@ -71,38 +28,12 @@ const handleDirectUpload = async (req, res) => {
       return res.status(400).json({ success: false, error: 'No file provided' });
     }
 
-    const { category = 'forms', formId, associatedId } = req.body || {};
-    const targetFormId = formId || associatedId;
-    const originalFilename = file.originalname || file.name || `camera_${Date.now()}.jpg`;
+    const { category = 'forms' } = req.body || {};
+    const originalFilename = file.originalname || file.name || `upload_${Date.now()}`;
     const buffer = file.buffer || file.data;
     const mimetype = file.mimetype || 'image/jpeg';
     
-    // 1. First try AWS S3 / CloudFront
-    if (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY) {
-      try {
-        console.log(`[DIRECT UPLOAD] Attempting S3 upload for ${originalFilename}...`);
-        const s3Folder = (targetFormId && (category === 'forms' || category === 'form' || category === 'evidence'))
-          ? `focus_forms/forms/${targetFormId}`
-          : (category === 'forms' || category === 'form' || category === 'evidence' ? 'focus_forms/forms' : `focus_forms/${category}`);
-        const s3Result = await uploadToS3(buffer, originalFilename, s3Folder);
-        if (s3Result && (s3Result.url || s3Result.publicUrl)) {
-          const finalUrl = s3Result.publicUrl || s3Result.url;
-          console.log(`[DIRECT UPLOAD] S3 upload successful:`, finalUrl);
-          return res.json({
-            success: true,
-            publicUrl: finalUrl,
-            url: finalUrl,
-            key: s3Result.key || s3Result.public_id,
-            format: s3Result.format,
-            bytes: s3Result.bytes
-          });
-        }
-      } catch (s3Err) {
-        console.warn(`[DIRECT UPLOAD] S3 upload error:`, s3Err.message);
-      }
-    }
-
-    // 2. Try Cloudinary if credentials are configured
+    // 1. First try Cloudinary if credentials are configured
     if (process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET) {
       try {
         console.log(`[DIRECT UPLOAD] Attempting Cloudinary upload for ${originalFilename}...`);
@@ -119,11 +50,56 @@ const handleDirectUpload = async (req, res) => {
           });
         }
       } catch (cloudErr) {
-        console.warn(`[DIRECT UPLOAD] Cloudinary upload failed (${cloudErr.message}), falling back to MongoDB GridFS storage...`);
+        console.warn(`[DIRECT UPLOAD] Cloudinary upload failed (${cloudErr.message}), falling back to local disk storage...`);
       }
     }
 
-    // 3. Fallback: Save directly to MongoDB GridFS
+    // 2. Reliable Fallback: Save directly to server disk (/uploads folder)
+    // This avoids consuming MongoDB Atlas storage quota with binary images.
+    try {
+      const uploadsDir = path.join(process.cwd(), 'uploads');
+      if (!fs.existsSync(uploadsDir)) {
+        fs.mkdirSync(uploadsDir, { recursive: true });
+      }
+      const ext = mimetype.split('/')[1] || 'jpg';
+      const safeFilename = `${Date.now()}_${uuidv4().slice(0, 8)}.${ext}`;
+      const localFilePath = path.join(uploadsDir, safeFilename);
+      await fs.promises.writeFile(localFilePath, buffer);
+
+      const host = req.get('host');
+      const protocol = req.protocol === 'https' || req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
+      const fileUrl = `${protocol}://${host}/api/uploads/${safeFilename}`;
+      console.log(`[DIRECT UPLOAD] Stored file locally on disk: ${fileUrl}`);
+
+      // Try saving File record in DB if writable, but do not fail upload if DB quota is exceeded
+      try {
+        const fileRecord = new File({
+          filename: safeFilename,
+          originalName: originalFilename,
+          mimetype: mimetype,
+          size: buffer.length,
+          url: fileUrl,
+          associatedWith: { type: 'form', id: category },
+          isPublic: true
+        });
+        await fileRecord.save();
+      } catch (dbErr) {
+        console.warn(`[DIRECT UPLOAD] DB record save skipped (cluster read-only/quota):`, dbErr.message);
+      }
+
+      return res.json({
+        success: true,
+        publicUrl: fileUrl,
+        url: fileUrl,
+        key: safeFilename,
+        format: ext,
+        bytes: buffer.length
+      });
+    } catch (diskErr) {
+      console.warn(`[DIRECT UPLOAD] Disk storage fallback failed (${diskErr.message}), trying MongoDB GridFS...`);
+    }
+
+    // 3. Last Fallback: Save to MongoDB GridFS
     console.log(`[DIRECT UPLOAD] Storing file ${originalFilename} in MongoDB GridFS...`);
     const bucket = new mongoose.mongo.GridFSBucket(mongoose.connection.db, { bucketName: 'uploads' });
     const uniqueFilename = `${Date.now()}_${originalFilename.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
@@ -184,10 +160,44 @@ const handleDirectUpload = async (req, res) => {
 router.post('/direct', uploadMiddleware.single('file'), handleDirectUpload);
 router.put('/direct', uploadMiddleware.single('file'), handleDirectUpload);
 
+// File type validation
+const ALLOWED_FILE_TYPES = {
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/gif': 'gif',
+  'image/webp': 'webp',
+  'image/svg+xml': 'svg',
+  'application/pdf': 'pdf',
+  'application/msword': 'doc',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+  'application/vnd.ms-excel': 'xls',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+  'text/csv': 'csv',
+  'text/plain': 'txt'
+};
+
+const CATEGORIES = {
+  avatars: { maxSize: 5 * 1024 * 1024, path: 'avatars/' },
+  forms: { maxSize: 25 * 1024 * 1024, path: 'forms/' },
+  templates: { maxSize: 10 * 1024 * 1024, path: 'templates/' },
+  exports: { maxSize: 50 * 1024 * 1024, path: 'exports/' },
+  evidence: { maxSize: 25 * 1024 * 1024, path: 'evidence/' },
+  chat: { maxSize: 25 * 1024 * 1024, path: 'chat/' }
+};
+
+const s3Client = (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && process.env.S3_BUCKET_NAME) 
+  ? new S3Client({
+      region: process.env.AWS_REGION || 'us-east-1',
+      credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+      }
+    })
+  : null;
+
 router.post('/presigned-url', async (req, res) => {
   try {
-    const s3Config = getS3Config();
-    if (!s3Config) {
+    if (!s3Client) {
       return res.json({
         success: true,
         useDirectUpload: true,
@@ -195,16 +205,19 @@ router.post('/presigned-url', async (req, res) => {
       });
     }
 
-    const fileName = req.body.fileName || req.body.filename;
-    const fileType = req.body.fileType || req.body.type || 'image/jpeg';
-    const fileSize = req.body.fileSize || req.body.size || 1024 * 1024;
-    const category = req.body.category || 'forms';
-    const targetFormId = req.body.formId || req.body.associatedId;
+    const { fileName, fileType, fileSize, category = 'forms' } = req.body;
 
-    if (!fileName) {
+    if (!fileName || !fileType || !fileSize) {
       return res.status(400).json({
         success: false,
-        error: 'fileName is required'
+        error: 'fileName, fileType, and fileSize are required'
+      });
+    }
+
+    if (!ALLOWED_FILE_TYPES[fileType]) {
+      return res.status(400).json({
+        success: false,
+        error: 'File type not allowed'
       });
     }
 
@@ -216,25 +229,20 @@ router.post('/presigned-url', async (req, res) => {
       });
     }
 
-    const extension = ALLOWED_FILE_TYPES[fileType] || 'jpg';
-    const safeBase = fileName.replace(/\.[^/.]+$/, '').replace(/[^a-zA-Z0-9-_]/g, '_');
-    const uniquePart = `${Date.now()}_${uuidv4().substring(0, 8)}`;
-    const uniqueFileName = `${safeBase}_${uniquePart}.${extension}`;
-
-    const folderPrefix = (targetFormId && (category === 'forms' || category === 'form' || category === 'evidence'))
-      ? `focus_forms/forms/${targetFormId}/`
-      : categoryConfig.path;
-
-    const key = `${folderPrefix}${uniqueFileName}`;
+    const extension = ALLOWED_FILE_TYPES[fileType];
+    const uniqueId = uuidv4();
+    const key = `${categoryConfig.path}${uniqueId}.${extension}`;
 
     const command = new PutObjectCommand({
-      Bucket: s3Config.s3Bucket,
+      Bucket: process.env.S3_BUCKET_NAME,
       Key: key,
       ContentType: fileType
     });
 
-    const uploadUrl = await getSignedUrl(s3Config.s3Client, command, { expiresIn: 3600 });
-    const publicUrl = `https://${s3Config.cloudfrontDomain}/${key}`;
+    const uploadUrl = await getSignedUrl(s3Client, command, { expiresIn: 3600 });
+    const publicUrl = process.env.CLOUDFRONT_URL 
+      ? `${process.env.CLOUDFRONT_URL}/${key}`
+      : `https://${process.env.S3_BUCKET_NAME}.s3.${process.env.AWS_REGION || 'us-east-1'}.amazonaws.com/${key}`;
 
     res.json({
       success: true,

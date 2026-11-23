@@ -108,31 +108,20 @@ export const authenticateOptional = async (req, res, next) => {
       .select('-password')
       .populate('customRole');
 
-    if (!user) {
-      return res.status(401).json({
-        success: false,
-        message: 'Invalid token. User not found.'
-      });
-    }
-
-    if (!user.isActive) {
-      return res.status(401).json({
-        success: false,
-        message: 'Account has been deactivated.'
-      });
+    if (!user || !user.isActive) {
+      req.user = null;
+      return next();
     }
 
     user.lastLogin = new Date();
-    await user.save();
+    await user.save().catch((err) => console.warn('Failed to update lastLogin in authenticateOptional:', err.message));
 
     req.user = user;
     next();
   } catch (error) {
-    console.error('Authentication error:', error);
-    res.status(401).json({
-      success: false,
-      message: 'Invalid token.'
-    });
+    console.warn('Optional authentication token invalid/expired, proceeding unauthenticated:', error.message);
+    req.user = null;
+    next();
   }
 };
 

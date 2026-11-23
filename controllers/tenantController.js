@@ -198,6 +198,7 @@ export const getTenantsMinimal = async (req, res) => {
   try {
     const tenants = await Tenant.find({ isActive: true })
       .select('_id name companyName')
+      .collation({ locale: 'en', strength: 2 })
       .sort({ companyName: 1 })
       .lean();
 
