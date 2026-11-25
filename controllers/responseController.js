@@ -2995,14 +2995,115 @@ export const getRank = async (req, res) => {
     const { formId, questionId, answer } = req.query;
     const { tenantSlug } = req.params;
 
-    if (!formId || !questionId || answer === undefined) {
+    if (!formId) {
       return res.status(400).json({
         success: false,
-        message: 'formId, questionId, and answer are required'
+        message: 'formId is required'
       });
     }
 
     const strAnswer = extractAnswerString(answer);
+
+    // ── Mobile sync: list ALL attempts for this form ────────────────
+    // Flutter inspector sync calls /rank with empty questionId/answer to
+    // pull the full attempts history for a form. Return every final
+    // response for this form as `data.attempts` (aliased as `history`).
+    if (!questionId) {
+      let tenantId;
+      if (tenantSlug) {
+        const cachedTId = tenantSlugCache.get(tenantSlug);
+        if (cachedTId && cachedTId.expiresAt > Date.now()) {
+          tenantId = cachedTId.tenantId;
+        } else {
+          const tenant = await Tenant.findOne({ slug: tenantSlug, isActive: true });
+          if (tenant) {
+            tenantId = tenant._id;
+            tenantSlugCache.set(tenantSlug, { tenantId, expiresAt: Date.now() + 300000 });
+          }
+        }
+      }
+
+      let form = null;
+      const cachedFormEntry = formMetaCache.get(String(formId));
+      if (cachedFormEntry && cachedFormEntry.expiresAt > Date.now()) {
+        form = cachedFormEntry.form;
+      } else {
+        form = await Form.findOne({ id: formId });
+        if (!form && mongoose.Types.ObjectId.isValid(formId)) {
+          form = await Form.findById(formId);
+        }
+        if (!form) {
+          form = await Form.findOne({ _id: formId });
+        }
+        if (form) {
+          formMetaCache.set(String(formId), { form, expiresAt: Date.now() + 300000 });
+        }
+      }
+
+      if (!form) {
+        return res.status(404).json({ success: false, message: 'Form not found' });
+      }
+
+      const formIds = getThisFormIds(form, formId);
+
+      const allResponses = await Response.find({
+        $or: [
+          { questionId: { $in: formIds } },
+          { formId: { $in: formIds } }
+        ],
+        isSectionSubmit: { $ne: true }
+      })
+        .select('id _id status answers chassisNumber createdAt isDispatched dispatchedAt dispatchedByName biwReview submittedBy createdBy tenantId')
+        .sort({ createdAt: 1 })
+        .lean();
+
+      const attempts = allResponses.map((resp, index) => {
+        const answersMap = resp.answers instanceof Map ? Object.fromEntries(resp.answers) : (resp.answers || {});
+        const chassis = resp.chassisNumber || answersMap.chassis_number || answersMap.chassisNumber;
+        return {
+          attemptId: resp.id || resp._id,
+          id: resp.id || resp._id,
+          formId: formId,
+          chassisNumber: chassis || '',
+          rank: index + 1,
+          status: resp.status && resp.status !== 'pending' ? resp.status : 'Direct Ok',
+          answers: answersMap,
+          submittedBy: resp.submittedBy || resp.createdBy || null,
+          submittedAt: resp.createdAt,
+          isDispatched: resp.isDispatched || false,
+          dispatchedAt: resp.dispatchedAt || null,
+          dispatchedByName: resp.dispatchedByName || null,
+          biwReview: resp.biwReview || null,
+          createdAt: resp.createdAt,
+        };
+      });
+
+      const last = attempts[attempts.length - 1];
+      const payload = {
+        success: true,
+        data: {
+          rank: attempts.length + 1,
+          count: attempts.length,
+          attempts,
+          history: attempts,
+          previousStatus: last ? last.status : null,
+          lastResponseId: last ? last.attemptId : null,
+          isDispatched: attempts.some(r => r.isDispatched),
+          lastSubmittedBy: last ? last.submittedBy : null,
+          formTenantId: form.tenantId ? form.tenantId.toString() : null,
+          parentMatch: null,
+          followUpStatus: null,
+          chatCount: 0,
+          previousTenantRank: null,
+          dispatchedAt: null,
+          dispatchedByName: null,
+          biwReview: null
+        }
+      };
+
+      return res.status(200).json(payload);
+    }
+
     if (!strAnswer || strAnswer.trim().length < 2) {
       return res.status(200).json({
         success: true,
