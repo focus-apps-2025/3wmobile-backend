@@ -170,7 +170,10 @@ app.get("/", (req, res) => {
 app.get("/favicon.ico", (req, res) => res.status(204).end());
 
 // Serve uploaded files (fallback for any local uploads)
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+// Must match the directory upload.js writes to: process.cwd()/uploads
+const UPLOADS_DIR = path.join(process.cwd(), 'uploads');
+app.use('/api/uploads', express.static(UPLOADS_DIR));
+app.use('/uploads', express.static(UPLOADS_DIR)); // keep old path working
 
 // API Routes
 app.use("/api/auth", authRoutes);
@@ -183,7 +186,7 @@ app.use("/api/analytics", analyticsRoutes);
 app.use("/api/analytics-invites", (req, res, next) => {
   // Set a much higher timeout (10 minutes) for analytics invites specifically 
   // because PDF generation with Puppeteer can be extremely slow
-  req.setTimeout(600000); 
+  req.setTimeout(600000);
   next();
 }, analyticsInviteRoutes);
 app.use("/api/roles", roleRoutes);
